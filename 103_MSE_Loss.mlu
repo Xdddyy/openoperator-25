@@ -1,0 +1,126 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+#define CORE_NUM 4
+
+__mlu_entry__ void mse_kernel(
+    float *predictions,
+    float *targets,
+    float *output,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_pred[CHUNK_SIZE];
+    __nram__ float nram_targ[CHUNK_SIZE];
+    __nram__ float nram_diff[CHUNK_SIZE];
+
+    __sram__ float sram_partial[CORE_NUM];
+
+    float local_sum = 0.0f;
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+
+        uint32_t len =
+            (offset + CHUNK_SIZE <= count)
+                ? CHUNK_SIZE
+                : (count - offset);
+
+        uint32_t aligned_len = (len + 63) & ~63;
+
+        __memcpy(
+            nram_pred,
+            predictions + start + offset,
+            len * sizeof(float),
+            GDRAM2NRAM);
+
+        __memcpy(
+            nram_targ,
+            targets + start + offset,
+            len * sizeof(float),
+            GDRAM2NRAM);
+
+        __bang_sub(
+            nram_diff,
+            nram_pred,
+            nram_targ,
+            aligned_len);
+
+        __bang_mul(
+            nram_diff,
+            nram_diff,
+            nram_diff,
+            aligned_len);
+
+        for (uint32_t i = 0; i < len; i++) {
+            local_sum += nram_diff[i];
+        }
+    }
+
+    sram_partial[core_id] = local_sum;
+    __sync_cluster();
+
+    if (core_id == 0) {
+        float total_sum = 0.0f;
+        for (uint32_t i = 0; i < core_num; i++) {
+            total_sum += sram_partial[i];
+        }
+        output[0] = total_sum / (float)total;
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor predictions,
+    torch::Tensor targets) {
+
+    TORCH_CHECK(
+        predictions.is_contiguous(),
+        "Predictions must be contiguous");
+    TORCH_CHECK(
+        targets.is_contiguous(),
+        "Targets must be contiguous");
+
+    auto original_dtype = predictions.scalar_type();
+
+    torch::Tensor pred_fp32 = predictions;
+    torch::Tensor targ_fp32 = targets;
+    if (original_dtype != torch::kFloat) {
+        pred_fp32 = predictions.to(torch::kFloat);
+        targ_fp32 = targets.to(torch::kFloat);
+    }
+
+    auto output_fp32 = torch::empty(
+        {1},
+        torch::TensorOptions()
+            .dtype(torch::kFloat)
+            .device(pred_fp32.device()));
+
+    int total = pred_fp32.numel();
+
+    cnrtQueue_t queue =
+        torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {CORE_NUM, 1, 1};
+    cnrtFunctionType_t ktype =
+        cnrtFuncTypeUnion1;
+
+    mse_kernel<<<dim, ktype, queue>>>(
+        pred_fp32.data_ptr<float>(),
+        targ_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        total);
+
+    return output_fp32[0];
+}
