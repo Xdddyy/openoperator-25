@@ -9,9 +9,9 @@
 #define OUT_CHUNK 256
 
 __mlu_entry__ void conv1d_standard_kernel(
-    half *x,
-    half *kernel,
-    half *output,
+    float *x,
+    float *kernel,
+    float *output,
     int N, int Cin, int L,
     int Cout, int K,
     int stride, int padding, int dilation,
@@ -30,10 +30,10 @@ __mlu_entry__ void conv1d_standard_kernel(
                   (core_id < rem_n ? core_id : rem_n);
     int n_count = per_core_n + (core_id < rem_n ? 1 : 0);
 
-    __nram__ half  nram_input[NRAM_IN_MAX];
-    __nram__ half  nram_kernel[NRAM_KER_MAX];
-    __nram__ half  nram_patch[NRAM_PAT_MAX];
-    __nram__ half  nram_temp[NRAM_TMP_MAX];
+    __nram__ float nram_input[NRAM_IN_MAX];
+    __nram__ float nram_kernel[NRAM_KER_MAX];
+    __nram__ float nram_patch[NRAM_PAT_MAX];
+    __nram__ float nram_temp[NRAM_TMP_MAX];
     __nram__ float nram_acc[OUT_CHUNK];
 
     for (int ni = 0; ni < n_count; ni++) {
@@ -55,7 +55,7 @@ __mlu_entry__ void conv1d_standard_kernel(
 
                 __memcpy(nram_input,
                          x + n * Cin * L + ic_base * L,
-                         ic_tile_len * L * sizeof(half),
+                         ic_tile_len * L * sizeof(float),
                          GDRAM2NRAM);
 
                 for (int oc = oc_start;
@@ -91,7 +91,7 @@ __mlu_entry__ void conv1d_standard_kernel(
 
                             __memcpy(nram_kernel,
                                      kernel + oc * kernel_size + ks,
-                                     k_len * sizeof(half),
+                                     k_len * sizeof(float),
                                      GDRAM2NRAM);
 
                             for (int i_lo = 0; i_lo < lo_len; i_lo++) {
@@ -111,7 +111,7 @@ __mlu_entry__ void conv1d_standard_kernel(
                                         nram_patch[i] =
                                             nram_input[lic * L + in_pos];
                                     } else {
-                                        nram_patch[i] = (half)0.0f;
+                                        nram_patch[i] = 0.0f;
                                     }
                                 }
 
@@ -119,8 +119,7 @@ __mlu_entry__ void conv1d_standard_kernel(
                                            nram_patch, aligned_len);
 
                                 for (int i = 0; i < k_len; i++) {
-                                    nram_acc[i_lo] +=
-                                        (float)nram_temp[i];
+                                    nram_acc[i_lo] += nram_temp[i];
                                 }
                             }
                         }
@@ -128,7 +127,7 @@ __mlu_entry__ void conv1d_standard_kernel(
                         for (int i_lo = 0; i_lo < lo_len; i_lo++) {
                             output[n * Cout * Lout + oc * Lout +
                                    lo_start + i_lo] =
-                                (half)nram_acc[i_lo];
+                                nram_acc[i_lo];
                         }
                     }
                 }
@@ -155,26 +154,26 @@ torch::Tensor bang_func(
 
     auto original_dtype = x.scalar_type();
 
-    torch::Tensor x_half = x;
-    torch::Tensor kernel_half = kernel;
+    torch::Tensor x_fp32 = x;
+    torch::Tensor kernel_fp32 = kernel;
 
-    if (original_dtype != torch::kHalf) {
-        x_half = x.to(torch::kHalf);
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
     }
-    if (kernel_half.scalar_type() != torch::kHalf) {
-        kernel_half = kernel.to(torch::kHalf);
+    if (kernel_fp32.scalar_type() != torch::kFloat) {
+        kernel_fp32 = kernel.to(torch::kFloat);
     }
 
-    int N = x_half.size(0);
-    int Cin = x_half.size(1);
-    int L = x_half.size(2);
-    int Cout = kernel_half.size(0);
+    int N = x_fp32.size(0);
+    int Cin = x_fp32.size(1);
+    int L = x_fp32.size(2);
+    int Cout = kernel_fp32.size(0);
 
     int Lout = (L + 2 * padding - dilation * (kernel_size - 1) - 1)
                / stride + 1;
 
-    auto output_half = torch::empty({N, Cout, Lout},
-                                     x_half.options());
+    auto output_fp32 = torch::empty({N, Cout, Lout},
+                                     x_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
@@ -182,17 +181,17 @@ torch::Tensor bang_func(
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     conv1d_standard_kernel<<<dim, ktype, queue>>>(
-        (half *)x_half.data_ptr(),
-        (half *)kernel_half.data_ptr(),
-        (half *)output_half.data_ptr(),
+        x_fp32.data_ptr<float>(),
+        kernel_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
         N, in_channels, L,
         out_channels, kernel_size,
         stride, padding, dilation,
         groups, Lout);
 
-    if (original_dtype != torch::kHalf) {
-        return output_half.to(original_dtype);
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
     }
 
-    return output_half;
+    return output_fp32;
 }
