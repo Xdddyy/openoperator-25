@@ -24,11 +24,13 @@ __mlu_entry__ void conv1d_standard_kernel(
     int Cout_per_group = Cout / groups;
     int kernel_size = Cin_per_group * K;
 
-    int per_core_n = N / core_num;
-    int rem_n = N % core_num;
-    int n_start = core_id * per_core_n +
-                  (core_id < rem_n ? core_id : rem_n);
-    int n_count = per_core_n + (core_id < rem_n ? 1 : 0);
+    int total_work = N * Cout;
+    uint32_t per_core = total_work / core_num;
+    uint32_t rem = total_work % core_num;
+    uint32_t start = core_id * per_core +
+                     (core_id < rem ? core_id : rem);
+    uint32_t count = per_core +
+                     (core_id < rem ? 1 : 0);
 
     __nram__ float nram_input[NRAM_IN_MAX];
     __nram__ float nram_kernel[NRAM_KER_MAX];
@@ -36,30 +38,28 @@ __mlu_entry__ void conv1d_standard_kernel(
     __nram__ float nram_temp[NRAM_TMP_MAX];
     __nram__ float nram_acc[OUT_CHUNK];
 
-    for (int ni = 0; ni < n_count; ni++) {
-        int n = n_start + ni;
+    int ic_per_tile = NRAM_IN_MAX / L;
+    if (ic_per_tile < 1) ic_per_tile = 1;
 
-        for (int g = 0; g < groups; g++) {
-            int ic_start = g * Cin_per_group;
-            int oc_start = g * Cout_per_group;
-            int ic_per_tile = NRAM_IN_MAX / L;
-            if (ic_per_tile < 1) ic_per_tile = 1;
+    for (uint32_t wi = 0; wi < count; wi++) {
+        int work_idx = start + wi;
+        int n = work_idx / Cout;
+        int oc = work_idx % Cout;
+        int g = oc / Cout_per_group;
+        int ic_start = g * Cin_per_group;
 
-            for (int ic_tile = 0; ic_tile < Cin_per_group;
-                 ic_tile += ic_per_tile) {
+        for (int ic_tile = 0; ic_tile < Cin_per_group;
+             ic_tile += ic_per_tile) {
 
-                int ic_tile_len = (ic_tile + ic_per_tile <= Cin_per_group)
-                                      ? ic_per_tile
-                                      : (Cin_per_group - ic_tile);
-                int ic_base = ic_start + ic_tile;
+            int ic_tile_len = (ic_tile + ic_per_tile <= Cin_per_group)
+                                  ? ic_per_tile
+                                  : (Cin_per_group - ic_tile);
+            int ic_base = ic_start + ic_tile;
 
-                __memcpy(nram_input,
-                         x + n * Cin * L + ic_base * L,
-                         ic_tile_len * L * sizeof(float),
-                         GDRAM2NRAM);
-
-                for (int oc = oc_start;
-                     oc < oc_start + Cout_per_group; oc++) {
+            __memcpy(nram_input,
+                     x + n * Cin * L + ic_base * L,
+                     ic_tile_len * L * sizeof(float),
+                     GDRAM2NRAM);
 
                     for (int lo_start = 0; lo_start < Lout;
                          lo_start += OUT_CHUNK) {
@@ -177,9 +177,7 @@ __mlu_entry__ void conv1d_standard_kernel(
                                 nram_acc[i_lo];
                         }
                     }
-                }
             }
-        }
     }
 }
 
@@ -224,7 +222,7 @@ torch::Tensor bang_func(
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t dim = {32, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     conv1d_standard_kernel<<<dim, ktype, queue>>>(
