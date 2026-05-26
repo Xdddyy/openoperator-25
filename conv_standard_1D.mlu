@@ -2,11 +2,11 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define MAX_INPUT  32768
-#define MAX_KERNEL 16384
-#define MAX_PATCH  16384
-#define MAX_TEMP   16384
-#define OUT_CHUNK  256
+#define NRAM_IN_MAX  32768
+#define NRAM_KER_MAX 16384
+#define NRAM_PAT_MAX 16384
+#define NRAM_TMP_MAX 16384
+#define OUT_CHUNK 256
 
 __mlu_entry__ void conv1d_standard_kernel(
     float *x,
@@ -30,10 +30,10 @@ __mlu_entry__ void conv1d_standard_kernel(
                   (core_id < rem_n ? core_id : rem_n);
     int n_count = per_core_n + (core_id < rem_n ? 1 : 0);
 
-    __nram__ float nram_input[MAX_INPUT];
-    __nram__ float nram_kernel[MAX_KERNEL];
-    __nram__ float nram_patch[MAX_PATCH];
-    __nram__ float nram_temp[MAX_TEMP];
+    __nram__ float nram_input[NRAM_IN_MAX];
+    __nram__ float nram_kernel[NRAM_KER_MAX];
+    __nram__ float nram_patch[NRAM_PAT_MAX];
+    __nram__ float nram_temp[NRAM_TMP_MAX];
     __nram__ float nram_acc[OUT_CHUNK];
 
     for (int ni = 0; ni < n_count; ni++) {
@@ -42,7 +42,7 @@ __mlu_entry__ void conv1d_standard_kernel(
         for (int g = 0; g < groups; g++) {
             int ic_start = g * Cin_per_group;
             int oc_start = g * Cout_per_group;
-            int ic_per_tile = MAX_INPUT / L;
+            int ic_per_tile = NRAM_IN_MAX / L;
             if (ic_per_tile < 1) ic_per_tile = 1;
 
             for (int ic_tile = 0; ic_tile < Cin_per_group;
@@ -61,38 +61,38 @@ __mlu_entry__ void conv1d_standard_kernel(
                 for (int oc = oc_start;
                      oc < oc_start + Cout_per_group; oc++) {
 
-                    for (int ks = 0; ks < kernel_size; ks += MAX_KERNEL) {
-                        int k_len = (ks + MAX_KERNEL <= kernel_size)
-                                        ? MAX_KERNEL
-                                        : (kernel_size - ks);
-                        int aligned_len = (k_len + 63) & ~63;
+                    for (int lo_start = 0; lo_start < Lout;
+                         lo_start += OUT_CHUNK) {
+                        int lo_end =
+                            (lo_start + OUT_CHUNK <= Lout)
+                                ? lo_start + OUT_CHUNK
+                                : Lout;
+                        int lo_len = lo_end - lo_start;
 
-                        int k_ic_start = ks / K;
-                        int k_ic_end = (ks + k_len - 1) / K + 1;
-
-                        if (k_ic_end <= ic_tile ||
-                            k_ic_start >= ic_tile + ic_tile_len) {
-                            continue;
+                        for (int i = 0; i < lo_len; i++) {
+                            nram_acc[i] = 0.0f;
                         }
 
-                        __memcpy(nram_kernel,
-                                 kernel + oc * kernel_size + ks,
-                                 k_len * sizeof(float),
-                                 GDRAM2NRAM);
+                        for (int ks = 0; ks < kernel_size;
+                             ks += NRAM_KER_MAX) {
+                            int k_len =
+                                (ks + NRAM_KER_MAX <= kernel_size)
+                                    ? NRAM_KER_MAX
+                                    : (kernel_size - ks);
+                            int aligned_len = (k_len + 63) & ~63;
 
-                        for (int lo_start = 0; lo_start < Lout;
-                             lo_start += OUT_CHUNK) {
-                            int lo_end =
-                                (lo_start + OUT_CHUNK <= Lout)
-                                    ? lo_start + OUT_CHUNK
-                                    : Lout;
-                            int lo_len = lo_end - lo_start;
+                            int k_ic_start = ks / K;
+                            int k_ic_end = (ks + k_len - 1) / K + 1;
 
-                            if (ks == 0 && ic_tile == 0) {
-                                for (int i = 0; i < lo_len; i++) {
-                                    nram_acc[i] = 0.0f;
-                                }
+                            if (k_ic_end <= ic_tile ||
+                                k_ic_start >= ic_tile + ic_tile_len) {
+                                continue;
                             }
+
+                            __memcpy(nram_kernel,
+                                     kernel + oc * kernel_size + ks,
+                                     k_len * sizeof(float),
+                                     GDRAM2NRAM);
 
                             for (int i_lo = 0; i_lo < lo_len; i_lo++) {
                                 int l_out = lo_start + i_lo;
@@ -123,11 +123,11 @@ __mlu_entry__ void conv1d_standard_kernel(
                                 }
                             }
                         }
-                    }
 
-                    for (int lo = 0; lo < Lout; lo++) {
-                        output[n * Cout * Lout + oc * Lout + lo] =
-                            nram_acc[lo];
+                        for (int i_lo = 0; i_lo < lo_len; i_lo++) {
+                            output[n * Cout * Lout + oc * Lout +
+                                   lo_start + i_lo] = nram_acc[i_lo];
+                        }
                     }
                 }
             }
