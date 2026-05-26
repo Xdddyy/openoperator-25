@@ -100,28 +100,65 @@ __mlu_entry__ void conv1d_standard_kernel(
                                 int l_out = lo_start + i_lo;
 
                                 int pi = 0;
-                                for (int ic = k_ic_start;
-                                     ic < k_ic_end && pi < k_len; ic++) {
-                                    int lic = ic - ic_tile;
-                                    int k_start = (ic == k_ic_start)
-                                                      ? k_first_start : 0;
-                                    int k_end = (ic == k_ic_end - 1)
-                                                    ? k_last_end : K;
-                                    int k_count = k_end - k_start;
-                                    int in_pos = l_out * stride +
-                                                 k_start * dilation -
-                                                 padding;
-                                    for (int ki = 0;
-                                         ki < k_count && pi < k_len; ki++) {
-                                        if (in_pos >= 0 && in_pos < L &&
-                                            lic >= 0 && lic < ic_tile_len) {
-                                            nram_patch[pi] =
-                                                nram_input[lic * L + in_pos];
+                                if (dilation == 1) {
+                                    int in_base = l_out * stride - padding;
+                                    for (int ic = k_ic_start;
+                                         ic < k_ic_end && pi < k_len; ic++) {
+                                        int lic = ic - ic_tile;
+                                        int k_start = (ic == k_ic_start)
+                                                          ? k_first_start : 0;
+                                        int k_end = (ic == k_ic_end - 1)
+                                                        ? k_last_end : K;
+                                        int k_count = k_end - k_start;
+                                        if (lic >= 0 && lic < ic_tile_len) {
+                                            float *src = nram_input + lic * L;
+                                            int r0 = in_base + k_start;
+                                            int r1 = r0 + k_count;
+                                            if (r0 >= 0 && r1 <= L) {
+                                                for (int ki = 0; ki < k_count; ki++)
+                                                    nram_patch[pi++] = src[r0 + ki];
+                                            } else if (r1 <= 0 || r0 >= L) {
+                                                for (int ki = 0; ki < k_count; ki++)
+                                                    nram_patch[pi++] = 0.0f;
+                                            } else {
+                                                int lo = (r0 < 0) ? 0 : r0;
+                                                int hi = (r1 > L) ? L : r1;
+                                                for (int ki = 0; ki < lo - r0; ki++)
+                                                    nram_patch[pi++] = 0.0f;
+                                                for (int ki = lo; ki < hi; ki++)
+                                                    nram_patch[pi++] = src[ki];
+                                                for (int ki = hi; ki < r1; ki++)
+                                                    nram_patch[pi++] = 0.0f;
+                                            }
                                         } else {
-                                            nram_patch[pi] = 0.0f;
+                                            for (int ki = 0; ki < k_count; ki++)
+                                                nram_patch[pi++] = 0.0f;
                                         }
-                                        pi++;
-                                        in_pos += dilation;
+                                    }
+                                } else {
+                                    for (int ic = k_ic_start;
+                                         ic < k_ic_end && pi < k_len; ic++) {
+                                        int lic = ic - ic_tile;
+                                        int k_start = (ic == k_ic_start)
+                                                          ? k_first_start : 0;
+                                        int k_end = (ic == k_ic_end - 1)
+                                                        ? k_last_end : K;
+                                        int k_count = k_end - k_start;
+                                        int in_pos = l_out * stride +
+                                                     k_start * dilation -
+                                                     padding;
+                                        for (int ki = 0;
+                                             ki < k_count && pi < k_len; ki++) {
+                                            if (in_pos >= 0 && in_pos < L &&
+                                                lic >= 0 && lic < ic_tile_len) {
+                                                nram_patch[pi] =
+                                                    nram_input[lic * L + in_pos];
+                                            } else {
+                                                nram_patch[pi] = 0.0f;
+                                            }
+                                            pi++;
+                                            in_pos += dilation;
+                                        }
                                     }
                                 }
 
