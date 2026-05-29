@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define NRAM_BUF_SIZE 131072
+#define NRAM_BUF_SIZE 524288
 
 __mlu_entry__ void average_pooling_2d_kernel(
     float *x,
