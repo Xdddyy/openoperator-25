@@ -20,10 +20,8 @@ __mlu_entry__ void average_pooling_2d_kernel(
                      + (core_id < rem ? core_id : rem);
     uint32_t count = per_core + (core_id < rem ? 1 : 0);
 
-    // 调试：将 taskDim 和 taskId 写入 output[0] 和 output[1]
     if (taskId == 0) {
-        output[0] = (float)taskDim;
-        output[1] = (float)taskId;
+        __bang_printf("taskDim=%d taskId=%d\n", taskDim, taskId);
     }
 
     float scale = 1.0f / (float)(kernel_size * kernel_size);
