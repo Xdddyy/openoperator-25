@@ -25,46 +25,69 @@ __mlu_entry__ void average_pooling_2d_kernel(
 
     float scale = 1.0f / (float)(kernel_size * kernel_size);
 
-    // 双缓冲：buf_A 和 buf_B 交替作为当前计算缓冲和预取缓冲
+    // 计算高度方向分 tile 参数
+    // 每 buffer 最多容纳的输入行数，对齐到 kernel_size 整数倍
+    int max_tile_rows = NRAM_BUF_SIZE / W;
+    int rows_per_tile = (max_tile_rows / kernel_size) * kernel_size;
+    if (rows_per_tile < kernel_size) rows_per_tile = kernel_size;
+
+    // 双缓冲
     __nram__ float buf_A[NRAM_BUF_SIZE];
     __nram__ float buf_B[NRAM_BUF_SIZE];
 
     for (uint32_t p_idx = 0; p_idx < count; p_idx++) {
         int plane_idx = start + p_idx;
-        int n = plane_idx / C;
-        int c = plane_idx % C;
 
         float *input_plane = x + plane_idx * plane_size;
         float *output_plane = output + plane_idx * out_plane_size;
 
-        // 选择当前缓冲：偶数次用 buf_A，奇数次用 buf_B
-        float *cur_buf  = (p_idx % 2 == 0) ? buf_A : buf_B;
-        float *next_buf = (p_idx % 2 == 0) ? buf_B : buf_A;
+        int num_h_tiles = (H + rows_per_tile - 1) / rows_per_tile;
 
-        // 加载当前平面到 NRAM
-        __memcpy(cur_buf, input_plane,
-                 plane_size * sizeof(float), GDRAM2NRAM);
+        for (int t = 0; t < num_h_tiles; t++) {
+            int h_start = t * rows_per_tile;
+            int h_end = h_start + rows_per_tile;
+            if (h_end > H) h_end = H;
+            int tile_h = h_end - h_start;
 
-        // 预取下一个平面到另一缓冲（为后续 __memcpy_async 预留框架）
-        // 当前串行执行，后续可替换为异步拷贝实现 load/compute 重叠
-        if (p_idx + 1 < count) {
-            __memcpy(next_buf, x + (start + p_idx + 1) * plane_size,
-                     plane_size * sizeof(float), GDRAM2NRAM);
-        }
+            // 双缓冲选择
+            float *cur_buf = (t % 2 == 0) ? buf_A : buf_B;
+            float *next_buf = (t % 2 == 0) ? buf_B : buf_A;
 
-        // 从 NRAM 上的 cur_buf 计算该平面的所有输出位置
-        for (int ho = 0; ho < H_out; ho++) {
-            int h_start = ho * kernel_size;
-            for (int wo = 0; wo < W_out; wo++) {
-                int w_start = wo * kernel_size;
-                float sum = 0.0f;
-                for (int kh = 0; kh < kernel_size; kh++) {
-                    int row_base = (h_start + kh) * W;
-                    for (int kw = 0; kw < kernel_size; kw++) {
-                        sum += cur_buf[row_base + w_start + kw];
+            // 加载当前 tile 的所有行到 NRAM
+            __memcpy(cur_buf, input_plane + h_start * W,
+                     tile_h * W * sizeof(float), GDRAM2NRAM);
+
+            // 预取下一个 tile（有下一个 tile 时才执行）
+            if (t + 1 < num_h_tiles) {
+                int next_h_start = (t + 1) * rows_per_tile;
+                int next_h_end = next_h_start + rows_per_tile;
+                if (next_h_end > H) next_h_end = H;
+                int next_tile_h = next_h_end - next_h_start;
+                __memcpy(next_buf,
+                         input_plane + next_h_start * W,
+                         next_tile_h * W * sizeof(float), GDRAM2NRAM);
+            }
+
+            // 计算该 tile 覆盖的输出行范围
+            int ho_start = h_start / kernel_size;
+            int ho_end = (h_end - kernel_size) / kernel_size + 1;
+            if (ho_end > H_out) ho_end = H_out;
+
+            // 从 NRAM 计算该 tile 内的所有输出位置
+            for (int ho = ho_start; ho < ho_end; ho++) {
+                // NRAM 内的行偏移（相对于 tile 起始）
+                int h_local = ho * kernel_size - h_start;
+                for (int wo = 0; wo < W_out; wo++) {
+                    int w_start = wo * kernel_size;
+                    float sum = 0.0f;
+                    for (int kh = 0; kh < kernel_size; kh++) {
+                        int row_off = (h_local + kh) * W;
+                        for (int kw = 0; kw < kernel_size; kw++) {
+                            sum += cur_buf[row_off + w_start + kw];
+                        }
                     }
+                    output_plane[ho * W_out + wo] = sum * scale;
                 }
-                output_plane[ho * W_out + wo] = sum * scale;
             }
         }
     }
