@@ -10,10 +10,15 @@ Cambricon MLU370 BANG C 算子本地测试脚本
 依赖: torch, torch_mlu (寒武纪定制版)
 """
 
+import os
+import re
 import sys
 import time
+import sysconfig
+import shutil
 import argparse
 import pathlib
+import subprocess
 
 import torch
 
@@ -65,18 +70,113 @@ NUM_TO_NAME = {
 }
 
 
-def compile_and_load(mlu_path):
-    """编译 .mlu 文件并加载为 Python 模块"""
-    from torch.utils.cpp_extension import load
-
-    mlu_path = pathlib.Path(mlu_path)
-    module = load(
-        name=f"bang_{mlu_path.stem}",
-        sources=[str(mlu_path)],
-        verbose=False,
+def _detect_cncc():
+    """探测 cncc 编译器路径"""
+    neuware_home = os.environ.get("NEUWARE_HOME", "/usr/local/neuware")
+    cncc = os.path.join(neuware_home, "bin", "cncc")
+    if os.path.isfile(cncc) and os.access(cncc, os.X_OK):
+        return cncc
+    cncc = shutil.which("cncc")
+    if cncc:
+        return cncc
+    raise RuntimeError(
+        "未找到 cncc 编译器。请设置环境变量 NEUWARE_HOME 指向 Neuware SDK 安装目录。"
     )
+
+
+def _extract_bang_func_params(mlu_path):
+    """从 .mlu 文件中提取 bang_func 的参数声明列表
+
+    返回: list[str] 形如 ["torch::Tensor input", "double negative_slope"]
+    """
+    content = mlu_path.read_text()
+    m = re.search(r"bang_func\s*\(([^)]*)\)", content)
+    if not m:
+        raise RuntimeError(f"未在 {mlu_path} 中找到 bang_func 定义")
+    params_str = m.group(1)
+    if not params_str.strip():
+        return []
+    params = []
+    for part in params_str.split(","):
+        part = part.strip()
+        if part:
+            params.append(part)
+    return params
+
+
+def compile_and_load(mlu_path):
+    """编译 .mlu 文件并加载为 Python 模块
+
+    分三步:
+    1. cncc 将 .mlu 编译为 .o (BANG C 内核)
+    2. 生成包装器 .cpp 并利用 torch cpp_extension 编译、链接为 .so
+    3. 加载 .so 并返回模块
+    """
+    from torch.utils.cpp_extension import include_paths, load
+
+    mlu_path = pathlib.Path(mlu_path).resolve()
+    stem = mlu_path.stem
+    obj_path = mlu_path.with_suffix(".o")
+
+    cncc = _detect_cncc()
+
+    # ---------- Step 1: cncc 编译 .mlu -> .o ----------
+    torch_includes = include_paths()
+    cncc_cmd = [
+        cncc,
+        str(mlu_path),
+        "-o",
+        str(obj_path),
+        "--bang-mlu-arch=mtp_372",
+        "-c",
+        "-O3",
+        "-std=c++17",
+        "-fPIC",
+        "-D_GLIBCXX_USE_CXX11_ABI=0",
+    ]
+    for inc in torch_includes:
+        cncc_cmd += ["-I", inc]
+
+    python_include = sysconfig.get_paths().get("include", "")
+    if python_include:
+        cncc_cmd += ["-I", python_include]
+
+    mlu_include = os.path.join(os.path.dirname(torch_mlu.__file__), "include")
+    cncc_cmd += ["-I", mlu_include]
+
+    print(f"  cncc: {' '.join(cncc_cmd)}")
+    result = subprocess.run(cncc_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"cncc 编译失败:\n{result.stderr}\n{result.stdout}")
+
+    # ---------- Step 2: 生成包装器 + torch cpp_extension 链接 ----------
+    params = _extract_bang_func_params(mlu_path)
+    param_str = ", ".join(params) if params else ""
+    wrapper_code = f"""\
+#include <torch/extension.h>
+
+// bang_func 在 .o 中定义，此处仅做声明供 pybind11 绑定
+torch::Tensor bang_func({param_str});
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    m.def("bang_func", &bang_func, "BANG C kernel entry");
+}}
+"""
+    wrapper_path = mlu_path.parent / f"{stem}_wrapper.cpp"
+    wrapper_path.write_text(wrapper_code)
+
+    try:
+        module = load(
+            name=f"bang_{stem}",
+            sources=[str(wrapper_path)],
+            extra_objects=[str(obj_path)],
+            verbose=False,
+        )
+    finally:
+        wrapper_path.unlink(missing_ok=True)
+
     if not hasattr(module, "bang_func"):
-        raise RuntimeError(f"编译成功但模块中未找到 bang_func")
+        raise RuntimeError("编译成功但模块中未找到 bang_func")
     return module
 
 

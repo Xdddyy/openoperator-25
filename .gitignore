@@ -7,4 +7,6 @@
 __pycache__/
 *.pyc
 
+.vscode/
+AGENTS.md
 

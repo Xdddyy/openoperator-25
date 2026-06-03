@@ -25,7 +25,11 @@ else
 TARGETS := $(SRCS)
 endif
 
-CNCC_FLAGS := --bang-mlu-arch=$(ARCH) -c -O3
+PYTHON ?= python3
+TORCH_INC := $(shell $(PYTHON) -c "import torch; print(' '.join(['-I' + d for d in torch.utils.cpp_extension.include_paths()]))" 2>/dev/null)
+PYTHON_INC := $(shell $(PYTHON) -c "import sysconfig; print('-I' + sysconfig.get_paths().get('include', ''))" 2>/dev/null)
+MLU_INC := $(shell $(PYTHON) -c "import torch_mlu, os; print('-I' + os.path.join(os.path.dirname(torch_mlu.__file__), 'include'))" 2>/dev/null)
+CNCC_FLAGS := --bang-mlu-arch=$(ARCH) -c -O3 -std=c++17 $(TORCH_INC) $(PYTHON_INC) $(MLU_INC)
 
 .PHONY: all compile check clean
 
@@ -50,7 +54,7 @@ check:
 		echo "cncc:     NOT FOUND [请设置 NEUWARE_HOME]"; \
 	fi
 	@echo -n "MLU device: " && \
-		python3 -c "import torch; import torch_mlu; print(torch.mlu.device_count(), 'card(s)')" 2>/dev/null || \
+		$(PYTHON) -c "import torch; import torch_mlu; print(torch.mlu.device_count(), 'card(s)')" 2>/dev/null || \
 		echo "检测失败 (torch_mlu 未安装?)"
 
 clean:
