@@ -166,10 +166,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     wrapper_path.write_text(wrapper_code)
 
     try:
+        neuware_home = os.environ.get("NEUWARE_HOME", "/usr/local/neuware")
+        neuware_lib = os.path.join(neuware_home, "lib64")
+        if not os.path.isdir(neuware_lib):
+            neuware_lib = os.path.join(neuware_home, "lib")
+
         module = load(
             name=f"bang_{stem}",
             sources=[str(wrapper_path)],
-            extra_ldflags=[str(obj_path)],
+            extra_ldflags=[
+                str(obj_path),
+                f"-L{neuware_lib}",
+                f"-Wl,-rpath,{neuware_lib}",
+                "-lcnrt",
+            ],
             verbose=False,
         )
     finally:
