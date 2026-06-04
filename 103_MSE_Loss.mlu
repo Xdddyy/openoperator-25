@@ -25,6 +25,7 @@ __mlu_entry__ void mse_kernel(
     __nram__ float nram_pred[CHUNK_SIZE];
     __nram__ float nram_targ[CHUNK_SIZE];
     __nram__ float nram_diff[CHUNK_SIZE];
+    __nram__ float nram_sum[CHUNK_SIZE];
 
     float local_sum = 0.0f;
 
@@ -49,6 +50,11 @@ __mlu_entry__ void mse_kernel(
             len * sizeof(float),
             GDRAM2NRAM);
 
+        for (uint32_t i = len; i < aligned_len; i++) {
+            nram_pred[i] = 0.0f;
+            nram_targ[i] = 0.0f;
+        }
+
         __bang_sub(
             nram_diff,
             nram_pred,
@@ -61,9 +67,12 @@ __mlu_entry__ void mse_kernel(
             nram_diff,
             aligned_len);
 
-        for (uint32_t i = 0; i < len; i++) {
-            local_sum += nram_diff[i];
-        }
+        __bang_reduce_sum(
+            nram_sum,
+            nram_diff,
+            aligned_len);
+
+        local_sum += nram_sum[0];
     }
 
     if (core_id == 0) {
