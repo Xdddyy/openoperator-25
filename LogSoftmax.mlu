@@ -1,0 +1,202 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <float.h>
+#include <math.h>
+
+#define LOGSOFTMAX_TILE 4096
+#define NFU_ALIGN 64
+
+/* ============================================================================
+ * LogSoftmax Kernel
+ *
+ * 输入/输出数据格式为 float16，张量布局为连续的 [batch_size, feature_dim]。
+ * 主路径参考教程 03_softmax 的三遍扫描:
+ *   Pass 1: max(x)
+ *   Pass 2: sum(exp(x - max(x)))
+ *   Pass 3: x - max(x) - log(sum)
+ *
+ * half 数据在 NRAM 中转换为 float 后执行 exp/log/sum，最后转回 half 写回。
+ * 支持 dim = 1 / -1 按行计算，以及 dim = 0 / -2 按列计算。
+ * ============================================================================
+ */
+__mlu_entry__ void logsoftmax2d_half_kernel(
+    half *x,
+    half *output,
+    int batch_size,
+    int feature_dim,
+    int axis)
+{
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
+
+    int work_items = (axis == 1) ? batch_size : feature_dim;
+    uint32_t per_task = (uint32_t)work_items / task_num;
+    uint32_t remainder = (uint32_t)work_items % task_num;
+    uint32_t start = task_id * per_task +
+                     (task_id < remainder ? task_id : remainder);
+    uint32_t count = per_task +
+                     (task_id < remainder ? 1 : 0);
+
+    __nram__ half nram_half[LOGSOFTMAX_TILE + NFU_ALIGN];
+    __nram__ float nram_float[LOGSOFTMAX_TILE + NFU_ALIGN];
+    __nram__ float nram_reduce[2];
+
+    if (axis == 1) {
+        for (uint32_t row_offset = 0; row_offset < count; row_offset++) {
+            int row = (int)(start + row_offset);
+            int row_base = row * feature_dim;
+
+            float row_max = -FLT_MAX;
+
+            for (int col_base = 0; col_base < feature_dim;
+                 col_base += LOGSOFTMAX_TILE) {
+                int tile = (col_base + LOGSOFTMAX_TILE <= feature_dim)
+                               ? LOGSOFTMAX_TILE
+                               : (feature_dim - col_base);
+                int aligned_tile = (tile + NFU_ALIGN - 1) & ~(NFU_ALIGN - 1);
+
+                __memcpy(nram_half,
+                         x + row_base + col_base,
+                         tile * sizeof(half),
+                         GDRAM2NRAM);
+
+                __bang_half2float(nram_float, nram_half, aligned_tile);
+                for (int i = tile; i < aligned_tile; i++) {
+                    nram_float[i] = -FLT_MAX;
+                }
+
+                __bang_argmax(nram_reduce, nram_float, aligned_tile);
+                if (nram_reduce[0] > row_max) {
+                    row_max = nram_reduce[0];
+                }
+            }
+
+            float exp_sum = 0.0f;
+
+            for (int col_base = 0; col_base < feature_dim;
+                 col_base += LOGSOFTMAX_TILE) {
+                int tile = (col_base + LOGSOFTMAX_TILE <= feature_dim)
+                               ? LOGSOFTMAX_TILE
+                               : (feature_dim - col_base);
+                int aligned_tile = (tile + NFU_ALIGN - 1) & ~(NFU_ALIGN - 1);
+
+                __memcpy(nram_half,
+                         x + row_base + col_base,
+                         tile * sizeof(half),
+                         GDRAM2NRAM);
+
+                __bang_half2float(nram_float, nram_half, aligned_tile);
+                for (int i = tile; i < aligned_tile; i++) {
+                    nram_float[i] = -FLT_MAX;
+                }
+
+                __bang_sub_scalar(nram_float, nram_float, row_max,
+                                  aligned_tile);
+                __bang_active_exphp(nram_float, nram_float, aligned_tile);
+                __bang_sum(nram_reduce, nram_float, aligned_tile);
+                exp_sum += nram_reduce[0];
+            }
+
+            float log_denom = logf(exp_sum);
+
+            for (int col_base = 0; col_base < feature_dim;
+                 col_base += LOGSOFTMAX_TILE) {
+                int tile = (col_base + LOGSOFTMAX_TILE <= feature_dim)
+                               ? LOGSOFTMAX_TILE
+                               : (feature_dim - col_base);
+                int aligned_tile = (tile + NFU_ALIGN - 1) & ~(NFU_ALIGN - 1);
+
+                __memcpy(nram_half,
+                         x + row_base + col_base,
+                         tile * sizeof(half),
+                         GDRAM2NRAM);
+
+                __bang_half2float(nram_float, nram_half, aligned_tile);
+                for (int i = tile; i < aligned_tile; i++) {
+                    nram_float[i] = row_max;
+                }
+
+                __bang_sub_scalar(nram_float, nram_float,
+                                  row_max + log_denom,
+                                  aligned_tile);
+                __bang_float2half_rn(nram_half, nram_float, aligned_tile);
+
+                __memcpy(output + row_base + col_base,
+                         nram_half,
+                         tile * sizeof(half),
+                         NRAM2GDRAM);
+            }
+        }
+    } else {
+        // dim=0 是非连续列归约，使用标量路径保证语义正确。
+        for (uint32_t col_offset = 0; col_offset < count; col_offset++) {
+            int col = (int)(start + col_offset);
+
+            float col_max = -FLT_MAX;
+            for (int row = 0; row < batch_size; row++) {
+                float val = (float)x[row * feature_dim + col];
+                if (val > col_max) {
+                    col_max = val;
+                }
+            }
+
+            float exp_sum = 0.0f;
+            for (int row = 0; row < batch_size; row++) {
+                float val = (float)x[row * feature_dim + col];
+                exp_sum += expf(val - col_max);
+            }
+
+            float log_denom = logf(exp_sum);
+            for (int row = 0; row < batch_size; row++) {
+                int idx = row * feature_dim + col;
+                float val = (float)x[idx];
+                output[idx] = (half)(val - col_max - log_denom);
+            }
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int dim)
+{
+    TORCH_CHECK(x.is_contiguous(), "Input tensor x must be contiguous");
+    TORCH_CHECK(x.dim() == 2, "Input tensor x must be 2D: [batch_size, dim]");
+
+    int batch_size = (int)x.size(0);
+    int feature_dim = (int)x.size(1);
+    TORCH_CHECK(batch_size > 0, "batch_size must be greater than 0");
+    TORCH_CHECK(feature_dim > 0, "dim size must be greater than 0");
+
+    int axis = dim;
+    if (axis < 0) {
+        axis += 2;
+    }
+    TORCH_CHECK(axis == 0 || axis == 1,
+                "dim must be 0, 1, -2, or -1 for 2D input");
+
+    torch::Tensor x_half = x;
+    if (x.scalar_type() != torch::kHalf) {
+        x_half = x.to(torch::kHalf);
+    }
+
+    auto output = torch::empty_like(x_half);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    int work_items = (axis == 1) ? batch_size : feature_dim;
+    int task_num = (work_items < 64) ? work_items : 64;
+    cnrtDim3_t kernel_dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    logsoftmax2d_half_kernel<<<kernel_dim, ktype, queue>>>(
+        (half *)x_half.data_ptr(),
+        (half *)output.data_ptr(),
+        batch_size,
+        feature_dim,
+        axis);
+
+    return output;
+}
