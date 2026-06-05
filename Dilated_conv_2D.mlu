@@ -1,0 +1,207 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 256
+
+/* ============================================================================
+ * Dilated Conv2D Kernel
+ *
+ * 对四维输入张量 [batch, in_channels, H, W] 执行带有填充和空洞特性的二维卷积。
+ *
+ * 输出尺寸计算公式:
+ *   H_out = (H + 2*pad_h - dil_h*(kH-1) - 1) / stride_h + 1
+ *   W_out = (W + 2*pad_w - dil_w*(kW-1) - 1) / stride_w + 1
+ *
+ * 多核拆分: 按输出通道 + batch 维度并行，每个 core 负责若干 (n, oc) 对，
+ *           对每一对遍历 H_out x W_out 计算卷积结果。
+ * ============================================================================
+ */
+__mlu_entry__ void dilated_conv2d_kernel(
+    const float* input,       // [N, C_in, H, W]
+    const float* weight,      // [C_out, C_in, kH, kW]
+    float* output,            // [N, C_out, H_out, W_out]
+    int N,
+    int C_in,
+    int H,
+    int W,
+    int C_out,
+    int kH,
+    int kW,
+    int H_out,
+    int W_out,
+    int stride_h,
+    int stride_w,
+    int padding_h,
+    int padding_w,
+    int dilation_h,
+    int dilation_w)
+{
+    // ========================================================================
+    // 多核拆分: 按 (batch, output_channel) 组合拆分
+    // ========================================================================
+    uint32_t core_id   = taskId;
+    uint32_t core_num  = taskDim;
+    uint32_t total_tasks = (uint32_t)(N * C_out);
+    uint32_t per_core  = total_tasks / core_num;
+    uint32_t remainder = total_tasks % core_num;
+
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    // 输入/输出/权重的各维度 stride（用于手动索引）
+    int in_batch_stride   = C_in * H * W;
+    int in_channel_stride = H * W;
+    int w_oc_stride       = C_in * kH * kW;
+    int w_ic_stride       = kH * kW;
+    int out_batch_stride  = C_out * H_out * W_out;
+    int out_oc_stride     = H_out * W_out;
+
+    // ========================================================================
+    // 每个 core 处理分配给它的 (n, oc) 对
+    // ========================================================================
+    for (uint32_t t = 0; t < count; t++) {
+        uint32_t task_idx = start + t;
+        int n  = (int)(task_idx / (uint32_t)C_out);
+        int oc = (int)(task_idx % (uint32_t)C_out);
+
+        // 当前 (n, oc) 的输出起始地址
+        float* out_base = output + n * out_batch_stride + oc * out_oc_stride;
+
+        // 遍历输出空间位置
+        for (int oh = 0; oh < H_out; oh++) {
+            for (int ow = 0; ow < W_out; ow++) {
+
+                float sum = 0.0f;
+
+                // 遍历输入通道
+                for (int ic = 0; ic < C_in; ic++) {
+
+                    const float* in_ch_base =
+                        input + n * in_batch_stride + ic * in_channel_stride;
+
+                    const float* w_base =
+                        weight + oc * w_oc_stride + ic * w_ic_stride;
+
+                    // 遍历卷积核
+                    for (int kh = 0; kh < kH; kh++) {
+                        int ih = oh * stride_h + kh * dilation_h - padding_h;
+
+                        // 跳过填充区域
+                        if (ih < 0 || ih >= H) continue;
+
+                        for (int kw = 0; kw < kW; kw++) {
+                            int iw = ow * stride_w + kw * dilation_w - padding_w;
+
+                            // 跳过填充区域
+                            if (iw < 0 || iw >= W) continue;
+
+                            sum += in_ch_base[ih * W + iw] * w_base[kh * kW + kw];
+                        }
+                    }
+                }
+
+                out_base[oh * W_out + ow] = sum;
+            }
+        }
+    }
+}
+
+
+/* ============================================================================
+ * bang_func — 外部调用接口
+ *
+ * 参数说明 (对应 __init__ 中的定义):
+ *   input:       输入张量，形状 [batch, in_channels, H, W]
+ *   weight:      卷积核张量，形状 [out_channels, in_channels, kH, kW]
+ *   kernel_h:    卷积核高度
+ *   kernel_w:    卷积核宽度
+ *   stride_h:    步长高度 (默认 1)
+ *   stride_w:    步长宽度 (默认 1)
+ *   padding_h:   填充高度 (默认 0)
+ *   padding_w:   填充宽度 (默认 0)
+ *   dilation_h:  空洞系数高度 (默认 1)
+ *   dilation_w:  空洞系数宽度 (默认 1)
+ *
+ * 返回值:
+ *   卷积输出张量，形状 [batch, out_channels, H_out, W_out]
+ * ============================================================================
+ */
+torch::Tensor bang_func(
+    torch::Tensor input,
+    torch::Tensor weight,
+    int64_t kernel_h,
+    int64_t kernel_w,
+    int64_t stride_h,
+    int64_t stride_w,
+    int64_t padding_h,
+    int64_t padding_w,
+    int64_t dilation_h,
+    int64_t dilation_w)
+{
+    // 输入校验
+    TORCH_CHECK(input.is_contiguous(),  "Input must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "Weight must be contiguous");
+    TORCH_CHECK(input.dim() == 4,       "Input must be 4D: [N, C, H, W]");
+    TORCH_CHECK(weight.dim() == 4,      "Weight must be 4D: [C_out, C_in, kH, kW]");
+
+    // 保留原始 dtype
+    auto original_dtype = input.scalar_type();
+
+    // -------- 统一转为 float32 计算 --------
+    torch::Tensor input_fp32  = input;
+    torch::Tensor weight_fp32 = weight;
+    if (original_dtype != torch::kFloat) {
+        input_fp32  = input.to(torch::kFloat);
+        weight_fp32 = weight.to(torch::kFloat);
+    }
+
+    // 维度信息
+    int N     = (int)input_fp32.size(0);
+    int C_in  = (int)input_fp32.size(1);
+    int H     = (int)input_fp32.size(2);
+    int W     = (int)input_fp32.size(3);
+    int C_out = (int)weight_fp32.size(0);
+    int kH    = (int)weight_fp32.size(2);
+    int kW    = (int)weight_fp32.size(3);
+
+    // 计算输出尺寸
+    int H_out = (H + 2 * (int)padding_h - (int)dilation_h * (kH - 1) - 1)
+                / (int)stride_h + 1;
+    int W_out = (W + 2 * (int)padding_w - (int)dilation_w * (kW - 1) - 1)
+                / (int)stride_w + 1;
+
+    TORCH_CHECK(H_out > 0 && W_out > 0,
+                "Invalid output size: H_out=", H_out, ", W_out=", W_out);
+
+    // -------- 分配输出张量 (与输入在同一设备) --------
+    auto output_fp32 = torch::empty(
+        {N, C_out, H_out, W_out},
+        torch::TensorOptions().dtype(torch::kFloat).device(input_fp32.device()));
+
+    // -------- 获取 MLU Stream 并启动 Kernel --------
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    dilated_conv2d_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        weight_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        N, C_in, H, W,
+        C_out, kH, kW,
+        H_out, W_out,
+        (int)stride_h, (int)stride_w,
+        (int)padding_h, (int)padding_w,
+        (int)dilation_h, (int)dilation_w);
+
+    // -------- 转回原 dtype --------
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
