@@ -2,19 +2,19 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 256
-
 /* ============================================================================
- * Dilated Conv2D Kernel
+ * Dilated Conv2D Kernel (NRAM 向量化版本)
  *
- * 对四维输入张量 [batch, in_channels, H, W] 执行带有填充和空洞特性的二维卷积。
+ * 对四维输入张量 [batch, in_channels, H, W] 执行带填充和空洞的二维卷积。
  *
- * 输出尺寸计算公式:
- *   H_out = (H + 2*pad_h - dil_h*(kH-1) - 1) / stride_h + 1
- *   W_out = (W + 2*pad_w - dil_w*(kW-1) - 1) / stride_w + 1
+ * 优化策略:
+ *   - NRAM 缓存: 一次加载一个输入通道到 NRAM，避免重复 GDRAM 访问
+ *   - BANG 向量化: 使用 __bang_mul_scalar + __bang_add 做行级 SIMD 乘加
+ *   - 多核拆分: 按 (batch, out_channel) 维度并行
  *
- * 多核拆分: 按输出通道 + batch 维度并行，每个 core 负责若干 (n, oc) 对，
- *           对每一对遍历 H_out x W_out 计算卷积结果。
+ * 输出尺寸:
+ *   H_out = (H + 2*pad - dil*(K-1) - 1) / stride + 1
+ *   W_out = (W + 2*pad - dil*(K-1) - 1) / stride + 1
  * ============================================================================
  */
 __mlu_entry__ void dilated_conv2d_kernel(
@@ -51,13 +51,26 @@ __mlu_entry__ void dilated_conv2d_kernel(
     uint32_t count = per_core +
                      (core_id < remainder ? 1 : 0);
 
-    // 输入/输出/权重的各维度 stride（用于手动索引）
+    // 各维度步长
     int in_batch_stride   = C_in * H * W;
     int in_channel_stride = H * W;
     int w_oc_stride       = C_in * kH * kW;
     int w_ic_stride       = kH * kW;
     int out_batch_stride  = C_out * H_out * W_out;
     int out_oc_stride     = H_out * W_out;
+
+    // ---- NRAM 缓冲区 ----
+    // 按 H 维度分 tile，保证输入/输出 tile 适配 NRAM 容量
+    // nram_in/out 各 16384 floats (64KB)，总计 128KB，安全在 512KB NRAM 内
+    int tile_h = H;
+    while ((tile_h * W > 16384 || tile_h * W_out > 16384) && tile_h > 1) {
+        tile_h /= 2;
+    }
+
+    // NRAM 变量声明于函数顶层，各 tile 复用
+    __nram__ float nram_in[16384];    // 输入通道 tile
+    __nram__ float nram_out[16384];   // 输出 tile 累加器
+    __nram__ float nram_tmp[256];     // 向量临时缓冲
 
     // ========================================================================
     // 每个 core 处理分配给它的 (n, oc) 对
@@ -67,44 +80,113 @@ __mlu_entry__ void dilated_conv2d_kernel(
         int n  = (int)(task_idx / (uint32_t)C_out);
         int oc = (int)(task_idx % (uint32_t)C_out);
 
-        // 当前 (n, oc) 的输出起始地址
-        float* out_base = output + n * out_batch_stride + oc * out_oc_stride;
+        // 当前 (n, oc) 的 GDRAM 输出基地址
+        float* out_gdram = output + n * out_batch_stride + oc * out_oc_stride;
 
-        // 遍历输出空间位置
-        for (int oh = 0; oh < H_out; oh++) {
-            for (int ow = 0; ow < W_out; ow++) {
+        // 按 tile_h 分块处理 H 维度
+        for (int oh_tile_start = 0; oh_tile_start < H_out; oh_tile_start += tile_h) {
+            int oh_tile_end = oh_tile_start + tile_h;
+            if (oh_tile_end > H_out) oh_tile_end = H_out;
+            int cur_tile_h = oh_tile_end - oh_tile_start;
+            int out_tile_size = cur_tile_h * W_out;
 
-                float sum = 0.0f;
+            // 清零输出 tile 累加器 (使用 BANG 向量写零)
+            __bang_write_zero(nram_out, out_tile_size);
 
-                // 遍历输入通道
-                for (int ic = 0; ic < C_in; ic++) {
+            // ----------------------------------------------------------------
+            // 遍历所有输入通道 ic
+            // ----------------------------------------------------------------
+            for (int ic = 0; ic < C_in; ic++) {
+                // 该输入通道的 GDRAM 基地址
+                const float* in_ch_base =
+                    input + n * in_batch_stride + ic * in_channel_stride;
 
-                    const float* in_ch_base =
-                        input + n * in_batch_stride + ic * in_channel_stride;
+                // 加载该 ic 下需要的输入行到 NRAM
+                // 空洞卷积的输出行 oh 对应的输入行范围:
+                //   [oh_tile_start - pad, oh_tile_end + (kH-1)*dil - pad)
+                int load_ih_start = oh_tile_start * stride_h - padding_h;
+                if (load_ih_start < 0) load_ih_start = 0;
+                int load_ih_end = (oh_tile_end - 1) * stride_h
+                                  + (kH - 1) * dilation_h - padding_h + 1;
+                if (load_ih_end > H) load_ih_end = H;
 
-                    const float* w_base =
-                        weight + oc * w_oc_stride + ic * w_ic_stride;
+                // 仅加载有效范围内的输入行到 NRAM
+                for (int ih = load_ih_start; ih < load_ih_end; ih++) {
+                    int nram_row = ih - load_ih_start;
+                    __memcpy(
+                        nram_in + nram_row * W,
+                        in_ch_base + ih * W,
+                        W * sizeof(float),
+                        GDRAM2NRAM);
+                }
 
-                    // 遍历卷积核
-                    for (int kh = 0; kh < kH; kh++) {
-                        int ih = oh * stride_h + kh * dilation_h - padding_h;
+                // 该 oc, ic 对应的权重基地址
+                const float* w_base =
+                    weight + oc * w_oc_stride + ic * w_ic_stride;
 
-                        // 跳过填充区域
-                        if (ih < 0 || ih >= H) continue;
+                // ------------------------------------------------------------
+                // 遍历卷积核位置 (kh, kw)
+                // ------------------------------------------------------------
+                for (int kh = 0; kh < kH; kh++) {
+                    int ih_offset = kh * dilation_h - padding_h;
 
-                        for (int kw = 0; kw < kW; kw++) {
-                            int iw = ow * stride_w + kw * dilation_w - padding_w;
+                    // 有效输出行范围: oh 使得 oh + ih_offset ∈ [0, H)
+                    int oh_k_start = 0 - ih_offset;   // oh >= -ih_offset
+                    if (oh_k_start < 0) oh_k_start = 0;
+                    int oh_k_end = H - ih_offset;      // oh < H - ih_offset
+                    if (oh_k_end > H_out) oh_k_end = H_out;
+                    // 与当前 tile 求交集
+                    if (oh_k_start < oh_tile_start) oh_k_start = oh_tile_start;
+                    if (oh_k_end > oh_tile_end) oh_k_end = oh_tile_end;
 
-                            // 跳过填充区域
-                            if (iw < 0 || iw >= W) continue;
+                    if (oh_k_start >= oh_k_end) continue;  // 无有效行
 
-                            sum += in_ch_base[ih * W + iw] * w_base[kh * kW + kw];
+                    for (int kw = 0; kw < kW; kw++) {
+                        float w_val = w_base[kh * kW + kw];
+                        if (w_val == 0.0f) continue;
+
+                        int iw_offset = kw * dilation_w - padding_w;
+
+                        // 有效输出列范围: ow 使得 ow + iw_offset ∈ [0, W)
+                        int ow_start = 0 - iw_offset;
+                        if (ow_start < 0) ow_start = 0;
+                        int ow_end = W - iw_offset;
+                        if (ow_end > W_out) ow_end = W_out;
+                        int valid_w = ow_end - ow_start;
+                        if (valid_w <= 0) continue;
+
+                        int iw_start = ow_start + iw_offset;
+
+                        // ---- 向量化: 逐行做乘加 ----
+                        for (int oh = oh_k_start; oh < oh_k_end; oh++) {
+                            int ih = oh + ih_offset;
+                            int nram_in_row = ih - load_ih_start;
+                            int nram_out_row = oh - oh_tile_start;
+
+                            // nram_out[oh] += w_val * nram_in[ih][iw_start:]
+                            __bang_mul_scalar(
+                                nram_tmp,
+                                nram_in + nram_in_row * W + iw_start,
+                                w_val,
+                                valid_w);
+                            __bang_add(
+                                nram_out + nram_out_row * W_out + ow_start,
+                                nram_out + nram_out_row * W_out + ow_start,
+                                nram_tmp,
+                                valid_w);
                         }
                     }
                 }
-
-                out_base[oh * W_out + ow] = sum;
             }
+
+            // ----------------------------------------------------------------
+            // 将该 tile 的累加结果写回 GDRAM
+            // ----------------------------------------------------------------
+            __memcpy(
+                out_gdram + oh_tile_start * W_out,
+                nram_out,
+                out_tile_size * sizeof(float),
+                NRAM2GDRAM);
         }
     }
 }
@@ -199,8 +281,9 @@ torch::Tensor bang_func(
     // -------- 获取 MLU Stream 并启动 Kernel --------
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    // 使用 cnrtFuncTypeBlock + 16 个任务，充分利用 MLU370 的 16 个核心
+    cnrtDim3_t dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     dilated_conv2d_kernel<<<dim, ktype, queue>>>(
         x_fp32.data_ptr<float>(),
