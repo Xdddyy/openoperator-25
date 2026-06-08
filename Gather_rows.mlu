@@ -1,8 +1,6 @@
 // 110_Gather_rows v110_15_block16_fullunroll_t4
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_15_block16_fullunroll_t4"
-
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
