@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_20_discrete_gather_block8_t8
+// 110_Gather_rows v110_21_discrete_gather_block8_offunroll_t4
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_20_discrete_gather_block8_t8"
+#warning "BUILD_VERSION v110_21_discrete_gather_block8_offunroll_t4"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -13,10 +13,70 @@
 #define N_COL 1024
 #define K_COL 32
 #define ROW_BLOCK 8
-#define TASK_DIM 8
+#define TASK_DIM 4
 
 #define INDEX_BLOCK_ELEMS  (ROW_BLOCK * K_COL)
 #define OUTPUT_BLOCK_ELEMS (ROW_BLOCK * K_COL)
+
+#define MAKE_OFF_HALF(K) do {                                      \
+    int c0 = (int)idx_buf[(K)];                                    \
+    int c1 = (int)idx_buf[32 + (K)];                               \
+    int c2 = (int)idx_buf[64 + (K)];                               \
+    int c3 = (int)idx_buf[96 + (K)];                               \
+    int c4 = (int)idx_buf[128 + (K)];                              \
+    int c5 = (int)idx_buf[160 + (K)];                              \
+    int c6 = (int)idx_buf[192 + (K)];                              \
+    int c7 = (int)idx_buf[224 + (K)];                              \
+    off_buf[(K)]       = (unsigned short)(c0 * 2);                 \
+    off_buf[32 + (K)]  = (unsigned short)((1024 + c1) * 2);        \
+    off_buf[64 + (K)]  = (unsigned short)((2048 + c2) * 2);        \
+    off_buf[96 + (K)]  = (unsigned short)((3072 + c3) * 2);        \
+    off_buf[128 + (K)] = (unsigned short)((4096 + c4) * 2);        \
+    off_buf[160 + (K)] = (unsigned short)((5120 + c5) * 2);        \
+    off_buf[192 + (K)] = (unsigned short)((6144 + c6) * 2);        \
+    off_buf[224 + (K)] = (unsigned short)((7168 + c7) * 2);        \
+} while (0)
+
+#define MAKE_OFF_FLOAT(K) do {                                     \
+    int c0 = (int)idx_buf[(K)];                                    \
+    int c1 = (int)idx_buf[32 + (K)];                               \
+    int c2 = (int)idx_buf[64 + (K)];                               \
+    int c3 = (int)idx_buf[96 + (K)];                               \
+    int c4 = (int)idx_buf[128 + (K)];                              \
+    int c5 = (int)idx_buf[160 + (K)];                              \
+    int c6 = (int)idx_buf[192 + (K)];                              \
+    int c7 = (int)idx_buf[224 + (K)];                              \
+    off_buf[(K)]       = (unsigned short)(c0 * 4);                 \
+    off_buf[32 + (K)]  = (unsigned short)((1024 + c1) * 4);        \
+    off_buf[64 + (K)]  = (unsigned short)((2048 + c2) * 4);        \
+    off_buf[96 + (K)]  = (unsigned short)((3072 + c3) * 4);        \
+    off_buf[128 + (K)] = (unsigned short)((4096 + c4) * 4);        \
+    off_buf[160 + (K)] = (unsigned short)((5120 + c5) * 4);        \
+    off_buf[192 + (K)] = (unsigned short)((6144 + c6) * 4);        \
+    off_buf[224 + (K)] = (unsigned short)((7168 + c7) * 4);        \
+} while (0)
+
+#define MAKE_ALL_OFF_HALF() do { \
+    MAKE_OFF_HALF(0);  MAKE_OFF_HALF(1);  MAKE_OFF_HALF(2);  MAKE_OFF_HALF(3);  \
+    MAKE_OFF_HALF(4);  MAKE_OFF_HALF(5);  MAKE_OFF_HALF(6);  MAKE_OFF_HALF(7);  \
+    MAKE_OFF_HALF(8);  MAKE_OFF_HALF(9);  MAKE_OFF_HALF(10); MAKE_OFF_HALF(11); \
+    MAKE_OFF_HALF(12); MAKE_OFF_HALF(13); MAKE_OFF_HALF(14); MAKE_OFF_HALF(15); \
+    MAKE_OFF_HALF(16); MAKE_OFF_HALF(17); MAKE_OFF_HALF(18); MAKE_OFF_HALF(19); \
+    MAKE_OFF_HALF(20); MAKE_OFF_HALF(21); MAKE_OFF_HALF(22); MAKE_OFF_HALF(23); \
+    MAKE_OFF_HALF(24); MAKE_OFF_HALF(25); MAKE_OFF_HALF(26); MAKE_OFF_HALF(27); \
+    MAKE_OFF_HALF(28); MAKE_OFF_HALF(29); MAKE_OFF_HALF(30); MAKE_OFF_HALF(31); \
+} while (0)
+
+#define MAKE_ALL_OFF_FLOAT() do { \
+    MAKE_OFF_FLOAT(0);  MAKE_OFF_FLOAT(1);  MAKE_OFF_FLOAT(2);  MAKE_OFF_FLOAT(3);  \
+    MAKE_OFF_FLOAT(4);  MAKE_OFF_FLOAT(5);  MAKE_OFF_FLOAT(6);  MAKE_OFF_FLOAT(7);  \
+    MAKE_OFF_FLOAT(8);  MAKE_OFF_FLOAT(9);  MAKE_OFF_FLOAT(10); MAKE_OFF_FLOAT(11); \
+    MAKE_OFF_FLOAT(12); MAKE_OFF_FLOAT(13); MAKE_OFF_FLOAT(14); MAKE_OFF_FLOAT(15); \
+    MAKE_OFF_FLOAT(16); MAKE_OFF_FLOAT(17); MAKE_OFF_FLOAT(18); MAKE_OFF_FLOAT(19); \
+    MAKE_OFF_FLOAT(20); MAKE_OFF_FLOAT(21); MAKE_OFF_FLOAT(22); MAKE_OFF_FLOAT(23); \
+    MAKE_OFF_FLOAT(24); MAKE_OFF_FLOAT(25); MAKE_OFF_FLOAT(26); MAKE_OFF_FLOAT(27); \
+    MAKE_OFF_FLOAT(28); MAKE_OFF_FLOAT(29); MAKE_OFF_FLOAT(30); MAKE_OFF_FLOAT(31); \
+} while (0)
 
 __mlu_entry__ void gather_rows_discrete_gather_half_kernel(
     const half *input,
@@ -30,7 +90,7 @@ __mlu_entry__ void gather_rows_discrete_gather_half_kernel(
     __nram__ unsigned short off_buf[INDEX_BLOCK_ELEMS];
     __nram__ half out_buf[OUTPUT_BLOCK_ELEMS];
 
-    int num_blocks = BATCH / ROW_BLOCK;  // 8
+    int num_blocks = BATCH / ROW_BLOCK;
 
     for (int blk = tid; blk < num_blocks; blk += tnum) {
         int b0 = blk * ROW_BLOCK;
@@ -44,16 +104,7 @@ __mlu_entry__ void gather_rows_discrete_gather_half_kernel(
                  INDEX_BLOCK_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
-        for (int r = 0; r < ROW_BLOCK; ++r) {
-            int row_base_elem = r * N_COL;
-            int idx_base = r * K_COL;
-
-            for (int k = 0; k < K_COL; ++k) {
-                int idx = (int)idx_buf[idx_base + k];
-                off_buf[idx_base + k] =
-                    (unsigned short)((row_base_elem + idx) * sizeof(half));
-            }
-        }
+        MAKE_ALL_OFF_HALF();
 
         __gather(out_buf,
                  input_ptr,
@@ -82,7 +133,7 @@ __mlu_entry__ void gather_rows_discrete_gather_float_kernel(
     __nram__ unsigned short off_buf[INDEX_BLOCK_ELEMS];
     __nram__ float out_buf[OUTPUT_BLOCK_ELEMS];
 
-    int num_blocks = BATCH / ROW_BLOCK;  // 8
+    int num_blocks = BATCH / ROW_BLOCK;
 
     for (int blk = tid; blk < num_blocks; blk += tnum) {
         int b0 = blk * ROW_BLOCK;
@@ -96,16 +147,7 @@ __mlu_entry__ void gather_rows_discrete_gather_float_kernel(
                  INDEX_BLOCK_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
-        for (int r = 0; r < ROW_BLOCK; ++r) {
-            int row_base_elem = r * N_COL;
-            int idx_base = r * K_COL;
-
-            for (int k = 0; k < K_COL; ++k) {
-                int idx = (int)idx_buf[idx_base + k];
-                off_buf[idx_base + k] =
-                    (unsigned short)((row_base_elem + idx) * sizeof(float));
-            }
-        }
+        MAKE_ALL_OFF_FLOAT();
 
         __gather(out_buf,
                  input_ptr,
@@ -144,7 +186,7 @@ torch::Tensor bang_func(torch::Tensor input,
             output.data_ptr<float>()
         );
     } else {
-        TORCH_CHECK(false, "v110_20 supports only float16/float32 input");
+        TORCH_CHECK(false, "v110_21 supports only float16/float32 input");
     }
 
     return output;
