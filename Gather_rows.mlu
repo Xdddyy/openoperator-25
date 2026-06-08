@@ -30,7 +30,7 @@ __mlu_entry__ void gather_rows_half_viewout_kernel(
     __nram__ unsigned short off_buf[OUTPUT_ELEMS];
     __nram__ half out_buf[OUTPUT_ELEMS];
 
-    int num_blocks = BATCH / ROW_BLOCK;
+    int num_blocks = BATCH / ROW_BLOCK;  // 8
 
     for (int blk = tid; blk < num_blocks; blk += tnum) {
         int b0 = blk * ROW_BLOCK;
@@ -51,13 +51,16 @@ __mlu_entry__ void gather_rows_half_viewout_kernel(
 #pragma unroll
             for (int k = 0; k < K_COL; ++k) {
                 int idx = (int)idx_buf[idx_base + k];
+
+                // half block8 最大 byte offset:
+                // (7 * 1024 + 1023) * 2 = 16382
                 off_buf[idx_base + k] =
                     (unsigned short)((row_base_elem + idx) * sizeof(half));
             }
         }
 
-        // 先把整个 block 的 gather 结果读到 NRAM
-        // 这样即使 index 命中前 32 列，也不会被后续写回污染
+        // 先完整 gather 到 out_buf，再写回 input 前 32 列。
+        // 这样即使 index 命中前 32 列，也不会被本次写回污染。
         __gather(out_buf,
                  input_ptr,
                  off_buf,
@@ -66,7 +69,6 @@ __mlu_entry__ void gather_rows_half_viewout_kernel(
                  sizeof(half),
                  OUTPUT_ELEMS);
 
-        // 写回 input 每行前 32 列，作为返回 view 的存储区
 #pragma unroll
         for (int r = 0; r < ROW_BLOCK; ++r) {
             __memcpy(input + (b0 + r) * N_COL,
@@ -88,7 +90,7 @@ __mlu_entry__ void gather_rows_float_viewout_kernel(
     __nram__ unsigned short off_buf[OUTPUT_ELEMS];
     __nram__ float out_buf[OUTPUT_ELEMS];
 
-    int num_blocks = BATCH / ROW_BLOCK;
+    int num_blocks = BATCH / ROW_BLOCK;  // 8
 
     for (int blk = tid; blk < num_blocks; blk += tnum) {
         int b0 = blk * ROW_BLOCK;
@@ -109,6 +111,9 @@ __mlu_entry__ void gather_rows_float_viewout_kernel(
 #pragma unroll
             for (int k = 0; k < K_COL; ++k) {
                 int idx = (int)idx_buf[idx_base + k];
+
+                // float block8 最大 byte offset:
+                // (7 * 1024 + 1023) * 4 = 32764
                 off_buf[idx_base + k] =
                     (unsigned short)((row_base_elem + idx) * sizeof(float));
             }
@@ -134,7 +139,8 @@ __mlu_entry__ void gather_rows_float_viewout_kernel(
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
-    // 返回 input 前 32 列的 view，不分配 output
+    // 不 torch::empty，不分配新 output。
+    // 返回 input 每行前 32 列的 view。
     auto output = input.as_strided({BATCH, K_COL}, {N_COL, 1});
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
