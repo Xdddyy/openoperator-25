@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_16_directinput_idxcopy_block8_unroll_t4
+// 110_Gather_rows v110_18_discrete_gather_block8_t4
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_16_directinput_idxcopy_block8_unroll_t4"
+#warning "BUILD_VERSION v110_18_discrete_gather_block8_t4"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -18,37 +18,7 @@
 #define INDEX_BLOCK_ELEMS  (ROW_BLOCK * K_COL)
 #define OUTPUT_BLOCK_ELEMS (ROW_BLOCK * K_COL)
 
-#define DO_GATHER_DIRECT(K) do {                                  \
-    int c0 = (int)idx_buf[(K)];                                   \
-    int c1 = (int)idx_buf[32 + (K)];                              \
-    int c2 = (int)idx_buf[64 + (K)];                              \
-    int c3 = (int)idx_buf[96 + (K)];                              \
-    int c4 = (int)idx_buf[128 + (K)];                             \
-    int c5 = (int)idx_buf[160 + (K)];                             \
-    int c6 = (int)idx_buf[192 + (K)];                             \
-    int c7 = (int)idx_buf[224 + (K)];                             \
-    out_buf[(K)]       = input_ptr[c0];                           \
-    out_buf[32 + (K)]  = input_ptr[1024 + c1];                    \
-    out_buf[64 + (K)]  = input_ptr[2048 + c2];                    \
-    out_buf[96 + (K)]  = input_ptr[3072 + c3];                    \
-    out_buf[128 + (K)] = input_ptr[4096 + c4];                    \
-    out_buf[160 + (K)] = input_ptr[5120 + c5];                    \
-    out_buf[192 + (K)] = input_ptr[6144 + c6];                    \
-    out_buf[224 + (K)] = input_ptr[7168 + c7];                    \
-} while (0)
-
-#define DO_ALL_GATHER_DIRECT() do { \
-    DO_GATHER_DIRECT(0);  DO_GATHER_DIRECT(1);  DO_GATHER_DIRECT(2);  DO_GATHER_DIRECT(3);  \
-    DO_GATHER_DIRECT(4);  DO_GATHER_DIRECT(5);  DO_GATHER_DIRECT(6);  DO_GATHER_DIRECT(7);  \
-    DO_GATHER_DIRECT(8);  DO_GATHER_DIRECT(9);  DO_GATHER_DIRECT(10); DO_GATHER_DIRECT(11); \
-    DO_GATHER_DIRECT(12); DO_GATHER_DIRECT(13); DO_GATHER_DIRECT(14); DO_GATHER_DIRECT(15); \
-    DO_GATHER_DIRECT(16); DO_GATHER_DIRECT(17); DO_GATHER_DIRECT(18); DO_GATHER_DIRECT(19); \
-    DO_GATHER_DIRECT(20); DO_GATHER_DIRECT(21); DO_GATHER_DIRECT(22); DO_GATHER_DIRECT(23); \
-    DO_GATHER_DIRECT(24); DO_GATHER_DIRECT(25); DO_GATHER_DIRECT(26); DO_GATHER_DIRECT(27); \
-    DO_GATHER_DIRECT(28); DO_GATHER_DIRECT(29); DO_GATHER_DIRECT(30); DO_GATHER_DIRECT(31); \
-} while (0)
-
-__mlu_entry__ void gather_rows_directinput_idxcopy_half_kernel(
+__mlu_entry__ void gather_rows_discrete_gather_half_kernel(
     const half *input,
     const int64_t *index,
     half *output
@@ -57,9 +27,10 @@ __mlu_entry__ void gather_rows_directinput_idxcopy_half_kernel(
     uint32_t tnum = taskDim;
 
     __nram__ int64_t idx_buf[INDEX_BLOCK_ELEMS];
+    __nram__ unsigned short off_buf[INDEX_BLOCK_ELEMS];
     __nram__ half out_buf[OUTPUT_BLOCK_ELEMS];
 
-    int num_blocks = BATCH / ROW_BLOCK;  // 8
+    int num_blocks = BATCH / ROW_BLOCK;
 
     for (int blk = tid; blk < num_blocks; blk += tnum) {
         int b0 = blk * ROW_BLOCK;
@@ -73,7 +44,27 @@ __mlu_entry__ void gather_rows_directinput_idxcopy_half_kernel(
                  INDEX_BLOCK_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
-        DO_ALL_GATHER_DIRECT();
+        // off_buf 单位是 byte。
+        // block 内第 r 行第 k 个元素:
+        // input_ptr[(r * 1024 + idx[r,k])]
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int row_base_elem = r * N_COL;
+            int idx_base = r * K_COL;
+
+            for (int k = 0; k < K_COL; ++k) {
+                int idx = (int)idx_buf[idx_base + k];
+                off_buf[idx_base + k] =
+                    (unsigned short)((row_base_elem + idx) * sizeof(half));
+            }
+        }
+
+        __gather(out_buf,
+                 input_ptr,
+                 off_buf,
+                 sizeof(half),
+                 GDRAM2NRAM,
+                 sizeof(half),
+                 OUTPUT_BLOCK_ELEMS);
 
         __memcpy(out_ptr,
                  out_buf,
@@ -82,7 +73,7 @@ __mlu_entry__ void gather_rows_directinput_idxcopy_half_kernel(
     }
 }
 
-__mlu_entry__ void gather_rows_directinput_idxcopy_float_kernel(
+__mlu_entry__ void gather_rows_discrete_gather_float_kernel(
     const float *input,
     const int64_t *index,
     float *output
@@ -91,9 +82,10 @@ __mlu_entry__ void gather_rows_directinput_idxcopy_float_kernel(
     uint32_t tnum = taskDim;
 
     __nram__ int64_t idx_buf[INDEX_BLOCK_ELEMS];
+    __nram__ unsigned short off_buf[INDEX_BLOCK_ELEMS];
     __nram__ float out_buf[OUTPUT_BLOCK_ELEMS];
 
-    int num_blocks = BATCH / ROW_BLOCK;  // 8
+    int num_blocks = BATCH / ROW_BLOCK;
 
     for (int blk = tid; blk < num_blocks; blk += tnum) {
         int b0 = blk * ROW_BLOCK;
@@ -107,7 +99,26 @@ __mlu_entry__ void gather_rows_directinput_idxcopy_float_kernel(
                  INDEX_BLOCK_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
-        DO_ALL_GATHER_DIRECT();
+        // float 情况最大 offset:
+        // (7*1024 + 1023) * 4 = 32764，仍然 fits unsigned short。
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int row_base_elem = r * N_COL;
+            int idx_base = r * K_COL;
+
+            for (int k = 0; k < K_COL; ++k) {
+                int idx = (int)idx_buf[idx_base + k];
+                off_buf[idx_base + k] =
+                    (unsigned short)((row_base_elem + idx) * sizeof(float));
+            }
+        }
+
+        __gather(out_buf,
+                 input_ptr,
+                 off_buf,
+                 sizeof(float),
+                 GDRAM2NRAM,
+                 sizeof(float),
+                 OUTPUT_BLOCK_ELEMS);
 
         __memcpy(out_ptr,
                  out_buf,
@@ -126,19 +137,19 @@ torch::Tensor bang_func(torch::Tensor input,
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        gather_rows_directinput_idxcopy_half_kernel<<<dim, ktype, queue>>>(
+        gather_rows_discrete_gather_half_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
     } else if (input.scalar_type() == torch::kFloat32) {
-        gather_rows_directinput_idxcopy_float_kernel<<<dim, ktype, queue>>>(
+        gather_rows_discrete_gather_float_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
         );
     } else {
-        TORCH_CHECK(false, "v110_16 supports only float16/float32 input");
+        TORCH_CHECK(false, "v110_18 supports only float16/float32 input");
     }
 
     return output;
