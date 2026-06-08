@@ -1,3 +1,6 @@
+// 110_Gather_rows v110_13_fullunroll8_half_port
+// submission version: no PYBIND11_MODULE
+
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
@@ -5,125 +8,145 @@
 #include "framework/core/MLUStream.h"
 
 #define BATCH 64
-#define N 1024
-#define K 32
-#define TASK_DIM 4
+#define N_COL 1024
+#define K_COL 32
+#define ROW_BLOCK 8
 
-__mlu_entry__ void gather_rows_float_kernel(
+#define INPUT_BLOCK_ELEMS  (ROW_BLOCK * N_COL)
+#define INDEX_BLOCK_ELEMS  (ROW_BLOCK * K_COL)
+#define OUTPUT_BLOCK_ELEMS (ROW_BLOCK * K_COL)
+
+#define DO_GATHER(K) do {                                      \
+    int c0 = (int)idx_buf[(K)];                                \
+    int c1 = (int)idx_buf[32 + (K)];                           \
+    int c2 = (int)idx_buf[64 + (K)];                           \
+    int c3 = (int)idx_buf[96 + (K)];                           \
+    int c4 = (int)idx_buf[128 + (K)];                          \
+    int c5 = (int)idx_buf[160 + (K)];                          \
+    int c6 = (int)idx_buf[192 + (K)];                          \
+    int c7 = (int)idx_buf[224 + (K)];                          \
+    out_buf[(K)]       = input_buf[c0];                        \
+    out_buf[32 + (K)]  = input_buf[1024 + c1];                 \
+    out_buf[64 + (K)]  = input_buf[2048 + c2];                 \
+    out_buf[96 + (K)]  = input_buf[3072 + c3];                 \
+    out_buf[128 + (K)] = input_buf[4096 + c4];                 \
+    out_buf[160 + (K)] = input_buf[5120 + c5];                 \
+    out_buf[192 + (K)] = input_buf[6144 + c6];                 \
+    out_buf[224 + (K)] = input_buf[7168 + c7];                 \
+} while (0)
+
+#define DO_ALL_GATHER() do { \
+    DO_GATHER(0);  DO_GATHER(1);  DO_GATHER(2);  DO_GATHER(3);  \
+    DO_GATHER(4);  DO_GATHER(5);  DO_GATHER(6);  DO_GATHER(7);  \
+    DO_GATHER(8);  DO_GATHER(9);  DO_GATHER(10); DO_GATHER(11); \
+    DO_GATHER(12); DO_GATHER(13); DO_GATHER(14); DO_GATHER(15); \
+    DO_GATHER(16); DO_GATHER(17); DO_GATHER(18); DO_GATHER(19); \
+    DO_GATHER(20); DO_GATHER(21); DO_GATHER(22); DO_GATHER(23); \
+    DO_GATHER(24); DO_GATHER(25); DO_GATHER(26); DO_GATHER(27); \
+    DO_GATHER(28); DO_GATHER(29); DO_GATHER(30); DO_GATHER(31); \
+} while (0)
+
+__mlu_entry__ void gather_rows_block8_full_unroll_float_kernel(
     const float *input,
     const int64_t *index,
     float *output
 ) {
     uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
 
-    __nram__ float rowbuf[N];
-    __nram__ int64_t idxbuf[K];
-    __nram__ float outbuf[K];
+    __nram__ float input_buf[INPUT_BLOCK_ELEMS];
+    __nram__ int64_t idx_buf[INDEX_BLOCK_ELEMS];
+    __nram__ float out_buf[OUTPUT_BLOCK_ELEMS];
 
-    for (int b = tid; b < BATCH; b += TASK_DIM) {
-        int in_base = b * N;
-        int idx_base = b * K;
-        int out_base = b * K;
+    int num_blocks = BATCH / ROW_BLOCK;
 
-        // 连续搬整行，避免 32 次随机 GDRAM scalar load
-        __memcpy(rowbuf,
-                 input + in_base,
-                 N * sizeof(float),
+    for (int blk = tid; blk < num_blocks; blk += tnum) {
+        int b0 = blk * ROW_BLOCK;
+
+        const float *input_ptr = input + b0 * N_COL;
+        const int64_t *idx_ptr = index + b0 * K_COL;
+        float *out_ptr = output + b0 * K_COL;
+
+        __memcpy(input_buf,
+                 input_ptr,
+                 INPUT_BLOCK_ELEMS * sizeof(float),
                  GDRAM2NRAM);
 
-        __memcpy(idxbuf,
-                 index + idx_base,
-                 K * sizeof(int64_t),
+        __memcpy(idx_buf,
+                 idx_ptr,
+                 INDEX_BLOCK_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
-        for (int k = 0; k < K; ++k) {
-            int idx = (int)idxbuf[k];
-            outbuf[k] = rowbuf[idx];
-        }
+        DO_ALL_GATHER();
 
-        __memcpy(output + out_base,
-                 outbuf,
-                 K * sizeof(float),
+        __memcpy(out_ptr,
+                 out_buf,
+                 OUTPUT_BLOCK_ELEMS * sizeof(float),
                  NRAM2GDRAM);
     }
 }
 
-__mlu_entry__ void gather_rows_half_kernel(
+__mlu_entry__ void gather_rows_block8_full_unroll_half_kernel(
     const half *input,
     const int64_t *index,
     half *output
 ) {
     uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
 
-    __nram__ half rowbuf[N];
-    __nram__ int64_t idxbuf[K];
-    __nram__ half outbuf[K];
+    __nram__ half input_buf[INPUT_BLOCK_ELEMS];
+    __nram__ int64_t idx_buf[INDEX_BLOCK_ELEMS];
+    __nram__ half out_buf[OUTPUT_BLOCK_ELEMS];
 
-    for (int b = tid; b < BATCH; b += TASK_DIM) {
-        int in_base = b * N;
-        int idx_base = b * K;
-        int out_base = b * K;
+    int num_blocks = BATCH / ROW_BLOCK;
 
-        // Half 一整行只有 2048B，连续搬入 NRAM 很便宜
-        __memcpy(rowbuf,
-                 input + in_base,
-                 N * sizeof(half),
+    for (int blk = tid; blk < num_blocks; blk += tnum) {
+        int b0 = blk * ROW_BLOCK;
+
+        const half *input_ptr = input + b0 * N_COL;
+        const int64_t *idx_ptr = index + b0 * K_COL;
+        half *out_ptr = output + b0 * K_COL;
+
+        __memcpy(input_buf,
+                 input_ptr,
+                 INPUT_BLOCK_ELEMS * sizeof(half),
                  GDRAM2NRAM);
 
-        __memcpy(idxbuf,
-                 index + idx_base,
-                 K * sizeof(int64_t),
+        __memcpy(idx_buf,
+                 idx_ptr,
+                 INDEX_BLOCK_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
-        for (int k = 0; k < K; ++k) {
-            int idx = (int)idxbuf[k];
-            outbuf[k] = rowbuf[idx];
-        }
+        DO_ALL_GATHER();
 
-        __memcpy(output + out_base,
-                 outbuf,
-                 K * sizeof(half),
+        __memcpy(out_ptr,
+                 out_buf,
+                 OUTPUT_BLOCK_ELEMS * sizeof(half),
                  NRAM2GDRAM);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
-    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
-    TORCH_CHECK(index.is_contiguous(), "index must be contiguous");
-
-    TORCH_CHECK(input.dim() == 2, "input must be 2D");
-    TORCH_CHECK(index.dim() == 2, "index must be 2D");
-
-    TORCH_CHECK(input.size(0) == BATCH && input.size(1) == N,
-                "110 assumes input [64,1024]");
-    TORCH_CHECK(index.size(0) == BATCH && index.size(1) == K,
-                "110 assumes index [64,32]");
-
-    auto output = torch::empty(
-        {BATCH, K},
-        input.options()
-    );
+    auto output = torch::empty({BATCH, K_COL}, input.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {TASK_DIM, 1, 1};
+    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    if (input.scalar_type() == torch::kFloat32) {
-        gather_rows_float_kernel<<<dim, ktype, queue>>>(
-            input.data_ptr<float>(),
-            index.data_ptr<int64_t>(),
-            output.data_ptr<float>()
-        );
-    } else if (input.scalar_type() == torch::kHalf) {
-        gather_rows_half_kernel<<<dim, ktype, queue>>>(
+    if (input.scalar_type() == torch::kHalf) {
+        gather_rows_block8_full_unroll_half_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
     } else {
-        TORCH_CHECK(false, "110 supports only float32/float16 input");
+        gather_rows_block8_full_unroll_float_kernel<<<dim, ktype, queue>>>(
+            input.data_ptr<float>(),
+            index.data_ptr<int64_t>(),
+            output.data_ptr<float>()
+        );
     }
 
     return output;
