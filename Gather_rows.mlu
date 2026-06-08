@@ -1,8 +1,5 @@
-// 110_Gather_rows v110_37g_probe_x8dummy_floorA_union1_nosync
-// submission version: no PYBIND11_MODULE
-
-#warning "BUILD_VERSION v110_37g_probe_x8dummy_floorA_union1_nosync"
-
+// 110_Gather_rows v110_38_gather_8launch_half_union1
+#warning "BUILD_VERSION v110_38_gather_8launch_half_union1"
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
@@ -10,71 +7,47 @@
 #include "framework/core/MLUStream.h"
 
 #define BATCH 64
+#define N_COL 1024
 #define K_COL 32
-#define TOTAL_OUTPUT_ELEMS (BATCH * K_COL)
+#define ROW_BLOCK 8
+#define NUM_BLOCKS (BATCH / ROW_BLOCK)      // 8
+#define BLK_ELEMS  (ROW_BLOCK * K_COL)      // 256
 
-__mlu_entry__ void empty_half_kernel(
-    const half *input,
-    const int64_t *index,
-    half *output
-) {
+__mlu_entry__ void gather_block_half_kernel(
+    const half *input, const int64_t *index, half *output, int blk) {
     if (taskId != 0) return;
+    int b0 = blk * ROW_BLOCK;
+    __nram__ int64_t idxbuf[BLK_ELEMS];
+    __nram__ half    outbuf[BLK_ELEMS];
+    __memcpy(idxbuf, index + b0 * K_COL, BLK_ELEMS * sizeof(int64_t), GDRAM2NRAM);
+    for (int r = 0; r < ROW_BLOCK; ++r) {
+        const half *row = input + (b0 + r) * N_COL;
+        int base = r * K_COL;
+        for (int k = 0; k < K_COL; ++k)
+            outbuf[base + k] = row[(int)idxbuf[base + k]];
+    }
+    __memcpy(output + b0 * K_COL, outbuf, BLK_ELEMS * sizeof(half), NRAM2GDRAM);
 }
 
-__mlu_entry__ void empty_float_kernel(
-    const float *input,
-    const int64_t *index,
-    float *output
-) {
+__mlu_entry__ void gather_block_float_kernel(
+    const float *input, const int64_t *index, float *output, int blk) {
     if (taskId != 0) return;
+    int b0 = blk * ROW_BLOCK;
+    __nram__ int64_t idxbuf[BLK_ELEMS];
+    __nram__ float   outbuf[BLK_ELEMS];
+    __memcpy(idxbuf, index + b0 * K_COL, BLK_ELEMS * sizeof(int64_t), GDRAM2NRAM);
+    for (int r = 0; r < ROW_BLOCK; ++r) {
+        const float *row = input + (b0 + r) * N_COL;
+        int base = r * K_COL;
+        for (int k = 0; k < K_COL; ++k)
+            outbuf[base + k] = row[(int)idxbuf[base + k]];
+    }
+    __memcpy(output + b0 * K_COL, outbuf, BLK_ELEMS * sizeof(float), NRAM2GDRAM);
 }
 
-__mlu_entry__ void floorA_half_kernel(
-    const half *input,
-    const int64_t *index,
-    half *output
-) {
-    if (taskId != 0) return;
-
-    __nram__ half buf[TOTAL_OUTPUT_ELEMS];
-
-    __memcpy(buf,
-             input,
-             TOTAL_OUTPUT_ELEMS * sizeof(half),
-             GDRAM2NRAM);
-
-    __memcpy(output,
-             buf,
-             TOTAL_OUTPUT_ELEMS * sizeof(half),
-             NRAM2GDRAM);
-}
-
-__mlu_entry__ void floorA_float_kernel(
-    const float *input,
-    const int64_t *index,
-    float *output
-) {
-    if (taskId != 0) return;
-
-    __nram__ float buf[TOTAL_OUTPUT_ELEMS];
-
-    __memcpy(buf,
-             input,
-             TOTAL_OUTPUT_ELEMS * sizeof(float),
-             GDRAM2NRAM);
-
-    __memcpy(output,
-             buf,
-             TOTAL_OUTPUT_ELEMS * sizeof(float),
-             NRAM2GDRAM);
-}
-
-torch::Tensor bang_func(torch::Tensor input,
-                        torch::Tensor index) {
+torch::Tensor bang_func(torch::Tensor input, torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
-
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
@@ -82,35 +55,16 @@ torch::Tensor bang_func(torch::Tensor input,
         const half *in_ptr = (const half*)input.data_ptr<at::Half>();
         const int64_t *idx_ptr = index.data_ptr<int64_t>();
         half *out_ptr = (half*)output.data_ptr<at::Half>();
-
-        // 关键：只 enqueue，不在 bang_func 内 sync
-        empty_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-
-        // 真 body：floorA，两次 memcpy
-        floorA_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-    } else {
+        for (int blk = 0; blk < NUM_BLOCKS; ++blk)
+            gather_block_half_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr, blk);
+    } else if (input.scalar_type() == torch::kFloat32) {
         const float *in_ptr = input.data_ptr<float>();
         const int64_t *idx_ptr = index.data_ptr<int64_t>();
         float *out_ptr = output.data_ptr<float>();
-
-        empty_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-        empty_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
-
-        floorA_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr);
+        for (int blk = 0; blk < NUM_BLOCKS; ++blk)
+            gather_block_float_kernel<<<dim, ktype, queue>>>(in_ptr, idx_ptr, out_ptr, blk);
+    } else {
+        TORCH_CHECK(false, "v110_38 supports only float16/float32 input");
     }
-
     return output;
 }
