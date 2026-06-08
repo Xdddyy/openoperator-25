@@ -1,0 +1,83 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <vector>
+
+#define BLOCK_SIZE 1024
+#define K_MAX 16
+
+__mlu_entry__ void topk_dim1_kernel(const half *x, half *values, int64_t *indices,
+                                    int batch, int cols, int k) {
+    int row = taskId;
+    if (row >= batch) {
+        return;
+    }
+
+    __nram__ half top_vals[K_MAX];
+    __nram__ int top_idx[K_MAX];
+
+    const half *row_ptr = x + row * cols;
+
+    for (int i = 0; i < k; ++i) {
+        top_vals[i] = (half)-65504.0f;
+        top_idx[i] = -1;
+    }
+
+    for (int j = 0; j < cols; ++j) {
+        half cur = row_ptr[j];
+        int insert_pos = -1;
+
+        for (int i = 0; i < k; ++i) {
+            if (cur > top_vals[i] || (cur == top_vals[i] && j < top_idx[i])) {
+                insert_pos = i;
+                break;
+            }
+        }
+
+        if (insert_pos >= 0) {
+            for (int i = k - 1; i > insert_pos; --i) {
+                top_vals[i] = top_vals[i - 1];
+                top_idx[i] = top_idx[i - 1];
+            }
+            top_vals[insert_pos] = cur;
+            top_idx[insert_pos] = j;
+        }
+    }
+
+    __memcpy(values + row * k, top_vals, k * sizeof(half), NRAM2GDRAM);
+
+    int64_t *idx_out = indices + row * k;
+    for (int i = 0; i < k; ++i) {
+        idx_out[i] = (int64_t)top_idx[i];
+    }
+}
+
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be float16");
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(dim == 1 || dim == -1, "only dim=1 is supported");
+    TORCH_CHECK(k > 0 && k <= K_MAX, "k must be in (0, K_MAX]");
+
+    int batch = x.size(0);
+    int cols = x.size(1);
+    TORCH_CHECK(cols <= BLOCK_SIZE, "cols must be <= BLOCK_SIZE");
+    TORCH_CHECK(k <= cols, "k must be <= cols");
+
+    auto values = torch::empty({batch, k}, x.options());
+    auto indices = torch::empty({batch, k}, x.options().dtype(torch::kInt64));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t task_dim = {batch, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    topk_dim1_kernel<<<task_dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(values.data_ptr<at::Half>()),
+        reinterpret_cast<int64_t *>(indices.data_ptr<int64_t>()),
+        batch,
+        cols,
+        k);
+
+    return {values, indices};
+}
