@@ -11,6 +11,7 @@ __mlu_entry__ void sqrt_kernel(half *input, half *output, int total) {
     uint32_t stride = task_num * BLOCK_SIZE;
 
     __nram__ half buffer[BLOCK_SIZE];
+    __nram__ float float_buffer[BLOCK_SIZE];
 
     for (uint32_t offset = start; offset < (uint32_t)total; offset += stride) {
         uint32_t remain = (uint32_t)total - offset;
@@ -19,7 +20,9 @@ __mlu_entry__ void sqrt_kernel(half *input, half *output, int total) {
 
         __memcpy(buffer, input + offset, len * sizeof(half), GDRAM2NRAM);
         __bang_abs(buffer, buffer, aligned_len);
-        __bang_sqrt(buffer, buffer, aligned_len);
+        __bang_half2float(float_buffer, buffer, aligned_len);
+        __bang_sqrt(float_buffer, float_buffer, aligned_len);
+        __bang_float2half(buffer, float_buffer, aligned_len);
         __memcpy(output + offset, buffer, len * sizeof(half), NRAM2GDRAM);
     }
 }
