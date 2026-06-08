@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_18_discrete_gather_block8_t4
+// 110_Gather_rows v110_19_discrete_gather_half_block32_float_block16
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_18_discrete_gather_block8_t4"
+#warning "BUILD_VERSION v110_19_discrete_gather_half_block32_float_block16"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -12,13 +12,18 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define ROW_BLOCK 8
-#define TASK_DIM 4
 
-#define INDEX_BLOCK_ELEMS  (ROW_BLOCK * K_COL)
-#define OUTPUT_BLOCK_ELEMS (ROW_BLOCK * K_COL)
+#define HALF_ROW_BLOCK 32
+#define HALF_TASK_DIM 2
+#define HALF_INDEX_ELEMS  (HALF_ROW_BLOCK * K_COL)
+#define HALF_OUTPUT_ELEMS (HALF_ROW_BLOCK * K_COL)
 
-__mlu_entry__ void gather_rows_discrete_gather_half_kernel(
+#define FLOAT_ROW_BLOCK 16
+#define FLOAT_TASK_DIM 4
+#define FLOAT_INDEX_ELEMS  (FLOAT_ROW_BLOCK * K_COL)
+#define FLOAT_OUTPUT_ELEMS (FLOAT_ROW_BLOCK * K_COL)
+
+__mlu_entry__ void gather_rows_discrete_gather_half_b32_kernel(
     const half *input,
     const int64_t *index,
     half *output
@@ -26,14 +31,14 @@ __mlu_entry__ void gather_rows_discrete_gather_half_kernel(
     uint32_t tid = taskId;
     uint32_t tnum = taskDim;
 
-    __nram__ int64_t idx_buf[INDEX_BLOCK_ELEMS];
-    __nram__ unsigned short off_buf[INDEX_BLOCK_ELEMS];
-    __nram__ half out_buf[OUTPUT_BLOCK_ELEMS];
+    __nram__ int64_t idx_buf[HALF_INDEX_ELEMS];
+    __nram__ unsigned short off_buf[HALF_OUTPUT_ELEMS];
+    __nram__ half out_buf[HALF_OUTPUT_ELEMS];
 
-    int num_blocks = BATCH / ROW_BLOCK;
+    int num_blocks = BATCH / HALF_ROW_BLOCK;  // 2
 
     for (int blk = tid; blk < num_blocks; blk += tnum) {
-        int b0 = blk * ROW_BLOCK;
+        int b0 = blk * HALF_ROW_BLOCK;
 
         const half *input_ptr = input + b0 * N_COL;
         const int64_t *idx_ptr = index + b0 * K_COL;
@@ -41,13 +46,10 @@ __mlu_entry__ void gather_rows_discrete_gather_half_kernel(
 
         __memcpy(idx_buf,
                  idx_ptr,
-                 INDEX_BLOCK_ELEMS * sizeof(int64_t),
+                 HALF_INDEX_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
-        // off_buf 单位是 byte。
-        // block 内第 r 行第 k 个元素:
-        // input_ptr[(r * 1024 + idx[r,k])]
-        for (int r = 0; r < ROW_BLOCK; ++r) {
+        for (int r = 0; r < HALF_ROW_BLOCK; ++r) {
             int row_base_elem = r * N_COL;
             int idx_base = r * K_COL;
 
@@ -64,16 +66,16 @@ __mlu_entry__ void gather_rows_discrete_gather_half_kernel(
                  sizeof(half),
                  GDRAM2NRAM,
                  sizeof(half),
-                 OUTPUT_BLOCK_ELEMS);
+                 HALF_OUTPUT_ELEMS);
 
         __memcpy(out_ptr,
                  out_buf,
-                 OUTPUT_BLOCK_ELEMS * sizeof(half),
+                 HALF_OUTPUT_ELEMS * sizeof(half),
                  NRAM2GDRAM);
     }
 }
 
-__mlu_entry__ void gather_rows_discrete_gather_float_kernel(
+__mlu_entry__ void gather_rows_discrete_gather_float_b16_kernel(
     const float *input,
     const int64_t *index,
     float *output
@@ -81,14 +83,14 @@ __mlu_entry__ void gather_rows_discrete_gather_float_kernel(
     uint32_t tid = taskId;
     uint32_t tnum = taskDim;
 
-    __nram__ int64_t idx_buf[INDEX_BLOCK_ELEMS];
-    __nram__ unsigned short off_buf[INDEX_BLOCK_ELEMS];
-    __nram__ float out_buf[OUTPUT_BLOCK_ELEMS];
+    __nram__ int64_t idx_buf[FLOAT_INDEX_ELEMS];
+    __nram__ unsigned short off_buf[FLOAT_OUTPUT_ELEMS];
+    __nram__ float out_buf[FLOAT_OUTPUT_ELEMS];
 
-    int num_blocks = BATCH / ROW_BLOCK;
+    int num_blocks = BATCH / FLOAT_ROW_BLOCK;  // 4
 
     for (int blk = tid; blk < num_blocks; blk += tnum) {
-        int b0 = blk * ROW_BLOCK;
+        int b0 = blk * FLOAT_ROW_BLOCK;
 
         const float *input_ptr = input + b0 * N_COL;
         const int64_t *idx_ptr = index + b0 * K_COL;
@@ -96,12 +98,10 @@ __mlu_entry__ void gather_rows_discrete_gather_float_kernel(
 
         __memcpy(idx_buf,
                  idx_ptr,
-                 INDEX_BLOCK_ELEMS * sizeof(int64_t),
+                 FLOAT_INDEX_ELEMS * sizeof(int64_t),
                  GDRAM2NRAM);
 
-        // float 情况最大 offset:
-        // (7*1024 + 1023) * 4 = 32764，仍然 fits unsigned short。
-        for (int r = 0; r < ROW_BLOCK; ++r) {
+        for (int r = 0; r < FLOAT_ROW_BLOCK; ++r) {
             int row_base_elem = r * N_COL;
             int idx_base = r * K_COL;
 
@@ -118,11 +118,11 @@ __mlu_entry__ void gather_rows_discrete_gather_float_kernel(
                  sizeof(float),
                  GDRAM2NRAM,
                  sizeof(float),
-                 OUTPUT_BLOCK_ELEMS);
+                 FLOAT_OUTPUT_ELEMS);
 
         __memcpy(out_ptr,
                  out_buf,
-                 OUTPUT_BLOCK_ELEMS * sizeof(float),
+                 FLOAT_OUTPUT_ELEMS * sizeof(float),
                  NRAM2GDRAM);
     }
 }
@@ -132,24 +132,26 @@ torch::Tensor bang_func(torch::Tensor input,
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    cnrtDim3_t dim = {TASK_DIM, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        gather_rows_discrete_gather_half_kernel<<<dim, ktype, queue>>>(
+        cnrtDim3_t dim = {HALF_TASK_DIM, 1, 1};
+
+        gather_rows_discrete_gather_half_b32_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
     } else if (input.scalar_type() == torch::kFloat32) {
-        gather_rows_discrete_gather_float_kernel<<<dim, ktype, queue>>>(
+        cnrtDim3_t dim = {FLOAT_TASK_DIM, 1, 1};
+
+        gather_rows_discrete_gather_float_b16_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
         );
     } else {
-        TORCH_CHECK(false, "v110_18 supports only float16/float32 input");
+        TORCH_CHECK(false, "v110_19 supports only float16/float32 input");
     }
 
     return output;
