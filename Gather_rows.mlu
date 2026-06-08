@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_44_gather_block8_union1_t4
+// 110_Gather_rows v110_45_rowcopy_direct_half_float_t4_online
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_44_gather_block8_union1_t4"
+#warning "BUILD_VERSION v110_45_rowcopy_direct_half_float_t4_online"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -12,127 +12,96 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-
-#define ROW_BLOCK 8
 #define TASK_DIM 4
 
-#define INDEX_ELEMS  (ROW_BLOCK * K_COL)
-#define OUTPUT_ELEMS (ROW_BLOCK * K_COL)
+#define DO_HALF(K) do {                                      \
+    int idx = (int)__load_gdram(index32 + ((idx_base + (K)) * 2)); \
+    out_buf[(K)] = row_buf[idx];                             \
+} while (0)
 
-__mlu_entry__ void gather_rows_half_block8_union1_kernel(
+#define DO_FLOAT(K) do {                                     \
+    int idx = (int)__load_gdram(index32 + ((idx_base + (K)) * 2)); \
+    out_buf[(K)] = row_buf[idx];                             \
+} while (0)
+
+#define DO_ALL_HALF() do { \
+    DO_HALF(0);  DO_HALF(1);  DO_HALF(2);  DO_HALF(3);  \
+    DO_HALF(4);  DO_HALF(5);  DO_HALF(6);  DO_HALF(7);  \
+    DO_HALF(8);  DO_HALF(9);  DO_HALF(10); DO_HALF(11); \
+    DO_HALF(12); DO_HALF(13); DO_HALF(14); DO_HALF(15); \
+    DO_HALF(16); DO_HALF(17); DO_HALF(18); DO_HALF(19); \
+    DO_HALF(20); DO_HALF(21); DO_HALF(22); DO_HALF(23); \
+    DO_HALF(24); DO_HALF(25); DO_HALF(26); DO_HALF(27); \
+    DO_HALF(28); DO_HALF(29); DO_HALF(30); DO_HALF(31); \
+} while (0)
+
+#define DO_ALL_FLOAT() do { \
+    DO_FLOAT(0);  DO_FLOAT(1);  DO_FLOAT(2);  DO_FLOAT(3);  \
+    DO_FLOAT(4);  DO_FLOAT(5);  DO_FLOAT(6);  DO_FLOAT(7);  \
+    DO_FLOAT(8);  DO_FLOAT(9);  DO_FLOAT(10); DO_FLOAT(11); \
+    DO_FLOAT(12); DO_FLOAT(13); DO_FLOAT(14); DO_FLOAT(15); \
+    DO_FLOAT(16); DO_FLOAT(17); DO_FLOAT(18); DO_FLOAT(19); \
+    DO_FLOAT(20); DO_FLOAT(21); DO_FLOAT(22); DO_FLOAT(23); \
+    DO_FLOAT(24); DO_FLOAT(25); DO_FLOAT(26); DO_FLOAT(27); \
+    DO_FLOAT(28); DO_FLOAT(29); DO_FLOAT(30); DO_FLOAT(31); \
+} while (0)
+
+__mlu_entry__ void gather_rows_half_rowcopy_direct_kernel(
     const half *input,
     const int64_t *index,
     half *output
 ) {
-#ifdef __BANG_ARCH__
-    if (__is_mpu()) return;
-#endif
-
     uint32_t tid = taskId;
-    uint32_t tnum = taskDim;
+    const int32_t *index32 = (const int32_t *)index;
 
-    __nram__ int64_t idx_buf[INDEX_ELEMS];
-    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
-    __nram__ half out_buf[OUTPUT_ELEMS];
+    __nram__ half row_buf[N_COL];
+    __nram__ half out_buf[K_COL];
 
-    int num_blocks = BATCH / ROW_BLOCK;  // 8
+    for (int b = tid; b < BATCH; b += TASK_DIM) {
+        int in_base = b * N_COL;
+        int idx_base = b * K_COL;
+        int out_base = b * K_COL;
 
-    for (int blk = tid; blk < num_blocks; blk += tnum) {
-        int b0 = blk * ROW_BLOCK;
-
-        const half *input_ptr = input + b0 * N_COL;
-        const int64_t *idx_ptr = index + b0 * K_COL;
-        half *out_ptr = output + b0 * K_COL;
-
-        __memcpy(idx_buf,
-                 idx_ptr,
-                 INDEX_ELEMS * sizeof(int64_t),
+        __memcpy(row_buf,
+                 input + in_base,
+                 N_COL * sizeof(half),
                  GDRAM2NRAM);
 
-#pragma unroll
-        for (int r = 0; r < ROW_BLOCK; ++r) {
-            int row_base_elem = r * N_COL;
-            int idx_base = r * K_COL;
+        DO_ALL_HALF();
 
-#pragma unroll
-            for (int k = 0; k < K_COL; ++k) {
-                int idx = (int)idx_buf[idx_base + k];
-
-                off_buf[idx_base + k] =
-                    (unsigned short)((row_base_elem + idx) * sizeof(half));
-            }
-        }
-
-        __gather(out_buf,
-                 input_ptr,
-                 off_buf,
-                 sizeof(half),
-                 GDRAM2NRAM,
-                 sizeof(half),
-                 OUTPUT_ELEMS);
-
-        __memcpy(out_ptr,
+        __memcpy(output + out_base,
                  out_buf,
-                 OUTPUT_ELEMS * sizeof(half),
+                 K_COL * sizeof(half),
                  NRAM2GDRAM);
     }
 }
 
-__mlu_entry__ void gather_rows_float_block8_union1_kernel(
+__mlu_entry__ void gather_rows_float_rowcopy_direct_kernel(
     const float *input,
     const int64_t *index,
     float *output
 ) {
-#ifdef __BANG_ARCH__
-    if (__is_mpu()) return;
-#endif
-
     uint32_t tid = taskId;
-    uint32_t tnum = taskDim;
+    const int32_t *index32 = (const int32_t *)index;
 
-    __nram__ int64_t idx_buf[INDEX_ELEMS];
-    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
-    __nram__ float out_buf[OUTPUT_ELEMS];
+    __nram__ float row_buf[N_COL];
+    __nram__ float out_buf[K_COL];
 
-    int num_blocks = BATCH / ROW_BLOCK;  // 8
+    for (int b = tid; b < BATCH; b += TASK_DIM) {
+        int in_base = b * N_COL;
+        int idx_base = b * K_COL;
+        int out_base = b * K_COL;
 
-    for (int blk = tid; blk < num_blocks; blk += tnum) {
-        int b0 = blk * ROW_BLOCK;
-
-        const float *input_ptr = input + b0 * N_COL;
-        const int64_t *idx_ptr = index + b0 * K_COL;
-        float *out_ptr = output + b0 * K_COL;
-
-        __memcpy(idx_buf,
-                 idx_ptr,
-                 INDEX_ELEMS * sizeof(int64_t),
+        __memcpy(row_buf,
+                 input + in_base,
+                 N_COL * sizeof(float),
                  GDRAM2NRAM);
 
-#pragma unroll
-        for (int r = 0; r < ROW_BLOCK; ++r) {
-            int row_base_elem = r * N_COL;
-            int idx_base = r * K_COL;
+        DO_ALL_FLOAT();
 
-#pragma unroll
-            for (int k = 0; k < K_COL; ++k) {
-                int idx = (int)idx_buf[idx_base + k];
-
-                off_buf[idx_base + k] =
-                    (unsigned short)((row_base_elem + idx) * sizeof(float));
-            }
-        }
-
-        __gather(out_buf,
-                 input_ptr,
-                 off_buf,
-                 sizeof(float),
-                 GDRAM2NRAM,
-                 sizeof(float),
-                 OUTPUT_ELEMS);
-
-        __memcpy(out_ptr,
+        __memcpy(output + out_base,
                  out_buf,
-                 OUTPUT_ELEMS * sizeof(float),
+                 K_COL * sizeof(float),
                  NRAM2GDRAM);
     }
 }
@@ -144,18 +113,16 @@ torch::Tensor bang_func(torch::Tensor input,
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     cnrtDim3_t dim = {TASK_DIM, 1, 1};
-
-    // 只改这个变量：Block -> Union1
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        gather_rows_half_block8_union1_kernel<<<dim, ktype, queue>>>(
+        gather_rows_half_rowcopy_direct_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
     } else {
-        gather_rows_float_block8_union1_kernel<<<dim, ktype, queue>>>(
+        gather_rows_float_rowcopy_direct_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
