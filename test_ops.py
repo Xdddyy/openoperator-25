@@ -47,14 +47,14 @@ OPS_META = {
         "extra": {"negative_slope": 0.01},
     },
     "Sqrt": {
-        "file": "070_Sqrt.mlu",
+        "file": "Sqrt.mlu",
         "args": ["x"],
         "ref": lambda x: torch.sqrt(torch.abs(x)),
         "shape": (1024, 256),
         "extra": {},
     },
     "MSE_Loss": {
-        "file": "103_MSE_Loss.mlu",
+        "file": "MSE_Loss.mlu",
         "args": ["predictions", "targets"],
         "ref": lambda pred, targ: torch.nn.functional.mse_loss(pred, targ),
         "shape": (1024, 256),
