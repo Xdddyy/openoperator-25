@@ -1,54 +1,98 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include "framework/core/MLUStream.h"
 
-#define CHUNK_SIZE 4096
-#define CORE_NUM 4
+#define NRAM_BUF_SIZE 65536
 
 __mlu_entry__ void gemv_kernel(
     float* A,
     float* B,
     float* C,
     int M,
-    int K) {
+    int K)
+{
+    // 按行拆分任务
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
+    uint32_t per_core_rows = M / task_num;
+    uint32_t remainder = M % task_num;
+    uint32_t start_row = task_id * per_core_rows + (task_id < remainder ? task_id : remainder);
+    uint32_t rows = per_core_rows + (task_id < remainder ? 1 : 0);
 
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core_rows = M / core_num;
-    uint32_t remainder = M % core_num;
-    uint32_t start_row = core_id * per_core_rows + (core_id < remainder ? core_id : remainder);
-    uint32_t rows = per_core_rows + (core_id < remainder ? 1 : 0);
+    // 计算每次分块的大小（元素个数）
+    // 双缓冲需要 4 个缓冲区，每个大小相同
+    const uint32_t max_chunk_elems = NRAM_BUF_SIZE / (4 * sizeof(float));
+    uint32_t chunk_size = max_chunk_elems;
+    if (chunk_size > K) chunk_size = K;
+    // 对齐到 64 的倍数（满足 __bang_mul 要求）
+    chunk_size = (chunk_size + 63) & ~63;
+    if (chunk_size == 0) chunk_size = 64;
 
-    __nram__ float a_chunk[CHUNK_SIZE];
-    __nram__ float b_chunk[CHUNK_SIZE];
-    __nram__ float mul_chunk[CHUNK_SIZE];
+    // 双缓冲缓冲区
+    __nram__ float a_buf0[chunk_size];
+    __nram__ float a_buf1[chunk_size];
+    __nram__ float b_buf0[chunk_size];
+    __nram__ float b_buf1[chunk_size];
+    __nram__ float mul_buf[chunk_size];
 
     for (uint32_t r = 0; r < rows; ++r) {
         uint32_t row_idx = start_row + r;
         float local_sum = 0.0f;
 
-        for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
-            uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
-            uint32_t aligned_len = (len + 63) & ~63;
+        uint32_t offset = 0;
+        // 当前使用的缓冲区指针
+        float *cur_a = a_buf0;
+        float *cur_b = b_buf0;
+        float *next_a = a_buf1;
+        float *next_b = b_buf1;
 
-            __memcpy(a_chunk, A + row_idx * K + offset, len * sizeof(float), GDRAM2NRAM);
-            __memcpy(b_chunk, B + offset, len * sizeof(float), GDRAM2NRAM);
+        // 预取第一个 chunk
+        uint32_t len0 = (K - offset < chunk_size) ? (K - offset) : chunk_size;
+        uint32_t aligned_len0 = (len0 + 63) & ~63;
+        __memcpy(cur_a, A + row_idx * K + offset, len0 * sizeof(float), GDRAM2NRAM);
+        __memcpy(cur_b, B + offset, len0 * sizeof(float), GDRAM2NRAM);
+        offset += len0;
 
-            __bang_mul(mul_chunk, a_chunk, b_chunk, aligned_len);
+        while (offset < K) {
+            // 预取下一个 chunk
+            uint32_t next_len = (K - offset < chunk_size) ? (K - offset) : chunk_size;
+            uint32_t aligned_next_len = (next_len + 63) & ~63;
+            __memcpy(next_a, A + row_idx * K + offset, next_len * sizeof(float), GDRAM2NRAM);
+            __memcpy(next_b, B + offset, next_len * sizeof(float), GDRAM2NRAM);
 
-            for (uint32_t i = 0; i < len; ++i) {
-                local_sum += mul_chunk[i];
+            // 计算当前 chunk
+            __bang_mul(mul_buf, cur_a, cur_b, aligned_len0);
+            for (uint32_t i = 0; i < len0; ++i) {
+                local_sum += mul_buf[i];
             }
+
+            // 交换缓冲区，准备处理下一个 chunk
+            float *tmp_a = cur_a;
+            float *tmp_b = cur_b;
+            cur_a = next_a;
+            cur_b = next_b;
+            next_a = tmp_a;
+            next_b = tmp_b;
+
+            offset += next_len;
+            len0 = next_len;
+            aligned_len0 = aligned_next_len;
         }
+
+        // 处理最后一个 chunk
+        __bang_mul(mul_buf, cur_a, cur_b, aligned_len0);
+        for (uint32_t i = 0; i < len0; ++i) {
+            local_sum += mul_buf[i];
+        }
+
         C[row_idx] = local_sum;
     }
 }
 
 torch::Tensor bang_func(
     torch::Tensor A,
-    torch::Tensor B) {
-
+    torch::Tensor B)
+{
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be 2D tensor");
@@ -67,11 +111,11 @@ torch::Tensor bang_func(
         B_fp32 = B.to(torch::kFloat);
     }
 
-    auto C = torch::empty({M, 1}, torch::TensorOptions().dtype(torch::kFloat).device(A_fp32.device()));
+    auto C = torch::empty({M, 1}, A_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {CORE_NUM, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    cnrtDim3_t dim = {64, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     gemv_kernel<<<dim, ktype, queue>>>(
         A_fp32.data_ptr<float>(),
@@ -79,9 +123,8 @@ torch::Tensor bang_func(
         C.data_ptr<float>(),
         M, K);
 
+    if (original_dtype != torch::kFloat) {
+        return C.to(original_dtype);
+    }
     return C;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bang_func", &bang_func, "Matrix-Vector Multiplication (GEMV)");
 }
