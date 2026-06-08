@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_32_split_allcopy_half_loop_t1
+// 110_Gather_rows v110_33_split_allcopy_half_idx32_t1
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_32_split_allcopy_half_loop_t1"
+#warning "BUILD_VERSION v110_33_split_allcopy_half_idx32_t1"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -24,7 +24,7 @@
 #define INDEX_BLOCK_ELEMS  (ROW_BLOCK * K_COL)
 #define OUTPUT_BLOCK_ELEMS (ROW_BLOCK * K_COL)
 
-__mlu_entry__ void gather_rows_split_allcopy_half_kernel(
+__mlu_entry__ void gather_rows_split_allcopy_half_idx32_kernel(
     const half *input,
     const int64_t *index,
     half *output
@@ -35,10 +35,10 @@ __mlu_entry__ void gather_rows_split_allcopy_half_kernel(
     }
 
     __nram__ half input_buf[TOTAL_INPUT_ELEMS];
-    __nram__ int64_t idx_buf[TOTAL_INDEX_ELEMS];
+    __nram__ int64_t raw_idx64[TOTAL_INDEX_ELEMS];
+    __nram__ int32_t idx32[TOTAL_INDEX_ELEMS];
     __nram__ half out_buf[TOTAL_OUTPUT_ELEMS];
 
-    // 避免单次 128KB GDRAM2NRAM，大概率是 v110_14 超时的风险点
     __memcpy(input_buf,
              input,
              HALF_COPY_ELEMS * sizeof(half),
@@ -49,10 +49,14 @@ __mlu_entry__ void gather_rows_split_allcopy_half_kernel(
              HALF_COPY_ELEMS * sizeof(half),
              GDRAM2NRAM);
 
-    __memcpy(idx_buf,
+    __memcpy(raw_idx64,
              index,
              TOTAL_INDEX_ELEMS * sizeof(int64_t),
              GDRAM2NRAM);
+
+    for (int i = 0; i < TOTAL_INDEX_ELEMS; ++i) {
+        idx32[i] = (int32_t)raw_idx64[i];
+    }
 
     for (int b = 0; b < BATCH; ++b) {
         int in_base = b * N_COL;
@@ -60,7 +64,7 @@ __mlu_entry__ void gather_rows_split_allcopy_half_kernel(
         int out_base = b * K_COL;
 
         for (int k = 0; k < K_COL; ++k) {
-            int idx = (int)idx_buf[idx_base + k];
+            int idx = idx32[idx_base + k];
             out_buf[out_base + k] = input_buf[in_base + idx];
         }
     }
@@ -133,7 +137,7 @@ torch::Tensor bang_func(torch::Tensor input,
     if (input.scalar_type() == torch::kHalf) {
         cnrtDim3_t dim = {1, 1, 1};
 
-        gather_rows_split_allcopy_half_kernel<<<dim, ktype, queue>>>(
+        gather_rows_split_allcopy_half_idx32_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
@@ -147,7 +151,7 @@ torch::Tensor bang_func(torch::Tensor input,
             output.data_ptr<float>()
         );
     } else {
-        TORCH_CHECK(false, "v110_32 supports only float16/float32 input");
+        TORCH_CHECK(false, "v110_33 supports only float16/float32 input");
     }
 
     return output;
