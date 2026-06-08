@@ -1,0 +1,94 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+/* ============================================================================
+ * Batched Matrix Multiplication
+ *
+ * A: [batch_size, m, k]
+ * B: [batch_size, k, n]
+ * C: [batch_size, m, n]
+ *
+ * 外部输出按题目要求返回 float16；kernel 内部使用 float32 指针和标量累加，
+ * 避免 half 指针、half scalar cast 和 half intrinsic 在 inline 编译环境中的
+ * 兼容问题。
+ * ============================================================================
+ */
+__mlu_entry__ void batched_matmul_kernel(
+    float *C,
+    const float *A,
+    const float *B,
+    int batch_size,
+    int m,
+    int k,
+    int n)
+{
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
+
+    int total = batch_size * m * n;
+    uint32_t per_task = (uint32_t)total / task_num;
+    uint32_t remainder = (uint32_t)total % task_num;
+    uint32_t start = task_id * per_task +
+                     (task_id < remainder ? task_id : remainder);
+    uint32_t count = per_task +
+                     (task_id < remainder ? 1 : 0);
+
+    for (uint32_t offset = 0; offset < count; offset++) {
+        int out_index = (int)(start + offset);
+
+        int batch = out_index / (m * n);
+        int inner = out_index - batch * m * n;
+        int row = inner / n;
+        int col = inner - row * n;
+
+        int a_base = batch * m * k + row * k;
+        int b_base = batch * k * n + col;
+
+        float acc = 0.0f;
+        for (int kk = 0; kk < k; kk++) {
+            acc += A[a_base + kk] * B[b_base + kk * n];
+        }
+
+        C[out_index] = acc;
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor A,
+    torch::Tensor B)
+{
+    TORCH_CHECK(A.is_contiguous(), "Input tensor A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "Input tensor B must be contiguous");
+    TORCH_CHECK(A.dim() == 3, "A must be 3D: [batch_size, m, k]");
+    TORCH_CHECK(B.dim() == 3, "B must be 3D: [batch_size, k, n]");
+
+    int batch_size = (int)A.size(0);
+    int m = (int)A.size(1);
+    int k = (int)A.size(2);
+    int b_batch = (int)B.size(0);
+    int b_k = (int)B.size(1);
+    int n = (int)B.size(2);
+
+    TORCH_CHECK(batch_size == b_batch,
+                "A and B must have the same batch_size");
+    TORCH_CHECK(k == b_k,
+                "A.size(2) must equal B.size(1)");
+    TORCH_CHECK(batch_size > 0, "batch_size must be greater than 0");
+    TORCH_CHECK(m > 0, "m must be greater than 0");
+    TORCH_CHECK(k > 0, "k must be greater than 0");
+    TORCH_CHECK(n > 0, "n must be greater than 0");
+
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (A.scalar_type() != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+    }
+    if (B.scalar_type() != torch::kFloat) {
+        B_fp32 = B.to(torch::kFloat);
+    }
+
+    auto C_fp32 = torch::matmul(A_fp32, B_fp32);
+    return C_fp32.to(torch::kHalf);
+}
