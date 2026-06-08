@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_43_halfonly_gather_block8_t4
+// 110_Gather_rows v110_44_gather_block8_union1_t4
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_43_halfonly_gather_block8_t4"
+#warning "BUILD_VERSION v110_44_gather_block8_union1_t4"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -19,11 +19,15 @@
 #define INDEX_ELEMS  (ROW_BLOCK * K_COL)
 #define OUTPUT_ELEMS (ROW_BLOCK * K_COL)
 
-__mlu_entry__ void gather_rows_halfonly_gather_block8_kernel(
+__mlu_entry__ void gather_rows_half_block8_union1_kernel(
     const half *input,
     const int64_t *index,
     half *output
 ) {
+#ifdef __BANG_ARCH__
+    if (__is_mpu()) return;
+#endif
+
     uint32_t tid = taskId;
     uint32_t tnum = taskDim;
 
@@ -54,8 +58,6 @@ __mlu_entry__ void gather_rows_halfonly_gather_block8_kernel(
             for (int k = 0; k < K_COL; ++k) {
                 int idx = (int)idx_buf[idx_base + k];
 
-                // half block8 最大 offset:
-                // (7 * 1024 + 1023) * 2 = 16382，uint16 足够
                 off_buf[idx_base + k] =
                     (unsigned short)((row_base_elem + idx) * sizeof(half));
             }
@@ -76,6 +78,65 @@ __mlu_entry__ void gather_rows_halfonly_gather_block8_kernel(
     }
 }
 
+__mlu_entry__ void gather_rows_float_block8_union1_kernel(
+    const float *input,
+    const int64_t *index,
+    float *output
+) {
+#ifdef __BANG_ARCH__
+    if (__is_mpu()) return;
+#endif
+
+    uint32_t tid = taskId;
+    uint32_t tnum = taskDim;
+
+    __nram__ int64_t idx_buf[INDEX_ELEMS];
+    __nram__ unsigned short off_buf[OUTPUT_ELEMS];
+    __nram__ float out_buf[OUTPUT_ELEMS];
+
+    int num_blocks = BATCH / ROW_BLOCK;  // 8
+
+    for (int blk = tid; blk < num_blocks; blk += tnum) {
+        int b0 = blk * ROW_BLOCK;
+
+        const float *input_ptr = input + b0 * N_COL;
+        const int64_t *idx_ptr = index + b0 * K_COL;
+        float *out_ptr = output + b0 * K_COL;
+
+        __memcpy(idx_buf,
+                 idx_ptr,
+                 INDEX_ELEMS * sizeof(int64_t),
+                 GDRAM2NRAM);
+
+#pragma unroll
+        for (int r = 0; r < ROW_BLOCK; ++r) {
+            int row_base_elem = r * N_COL;
+            int idx_base = r * K_COL;
+
+#pragma unroll
+            for (int k = 0; k < K_COL; ++k) {
+                int idx = (int)idx_buf[idx_base + k];
+
+                off_buf[idx_base + k] =
+                    (unsigned short)((row_base_elem + idx) * sizeof(float));
+            }
+        }
+
+        __gather(out_buf,
+                 input_ptr,
+                 off_buf,
+                 sizeof(float),
+                 GDRAM2NRAM,
+                 sizeof(float),
+                 OUTPUT_ELEMS);
+
+        __memcpy(out_ptr,
+                 out_buf,
+                 OUTPUT_ELEMS * sizeof(float),
+                 NRAM2GDRAM);
+    }
+}
+
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
@@ -83,14 +144,23 @@ torch::Tensor bang_func(torch::Tensor input,
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     cnrtDim3_t dim = {TASK_DIM, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    // 线上日志已经证明进入的是 half kernel，因此这里直接按 half 路径提交
-    gather_rows_halfonly_gather_block8_kernel<<<dim, ktype, queue>>>(
-        (const half*)input.data_ptr<at::Half>(),
-        index.data_ptr<int64_t>(),
-        (half*)output.data_ptr<at::Half>()
-    );
+    // 只改这个变量：Block -> Union1
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    if (input.scalar_type() == torch::kHalf) {
+        gather_rows_half_block8_union1_kernel<<<dim, ktype, queue>>>(
+            (const half*)input.data_ptr<at::Half>(),
+            index.data_ptr<int64_t>(),
+            (half*)output.data_ptr<at::Half>()
+        );
+    } else {
+        gather_rows_float_block8_union1_kernel<<<dim, ktype, queue>>>(
+            input.data_ptr<float>(),
+            index.data_ptr<int64_t>(),
+            output.data_ptr<float>()
+        );
+    }
 
     return output;
 }
