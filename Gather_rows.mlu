@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_29_scalar_row_t64_loadstore_unroll
+// 110_Gather_rows v110_30_scalar_elem_t2048_loadstore
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_29_scalar_row_t64_loadstore_unroll"
+#warning "BUILD_VERSION v110_30_scalar_elem_t2048_loadstore"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -12,80 +12,52 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define TASK_DIM 64
+#define TOTAL_OUT (BATCH * K_COL)
 
-#define DO_ONE_HALF(K) do {                                                     \
-    int idx = __load_gdram(index32 + ((idx_base + (K)) << 1));                  \
-    half v = __load_gdram(input + in_base + idx);                               \
-    __store_gdram(output + out_base + (K), v);                                  \
-} while (0)
-
-#define DO_ONE_FLOAT(K) do {                                                    \
-    int idx = __load_gdram(index32 + ((idx_base + (K)) << 1));                  \
-    float v = __load_gdram(input + in_base + idx);                              \
-    __store_gdram(output + out_base + (K), v);                                  \
-} while (0)
-
-#define DO_ALL_HALF() do { \
-    DO_ONE_HALF(0);  DO_ONE_HALF(1);  DO_ONE_HALF(2);  DO_ONE_HALF(3);  \
-    DO_ONE_HALF(4);  DO_ONE_HALF(5);  DO_ONE_HALF(6);  DO_ONE_HALF(7);  \
-    DO_ONE_HALF(8);  DO_ONE_HALF(9);  DO_ONE_HALF(10); DO_ONE_HALF(11); \
-    DO_ONE_HALF(12); DO_ONE_HALF(13); DO_ONE_HALF(14); DO_ONE_HALF(15); \
-    DO_ONE_HALF(16); DO_ONE_HALF(17); DO_ONE_HALF(18); DO_ONE_HALF(19); \
-    DO_ONE_HALF(20); DO_ONE_HALF(21); DO_ONE_HALF(22); DO_ONE_HALF(23); \
-    DO_ONE_HALF(24); DO_ONE_HALF(25); DO_ONE_HALF(26); DO_ONE_HALF(27); \
-    DO_ONE_HALF(28); DO_ONE_HALF(29); DO_ONE_HALF(30); DO_ONE_HALF(31); \
-} while (0)
-
-#define DO_ALL_FLOAT() do { \
-    DO_ONE_FLOAT(0);  DO_ONE_FLOAT(1);  DO_ONE_FLOAT(2);  DO_ONE_FLOAT(3);  \
-    DO_ONE_FLOAT(4);  DO_ONE_FLOAT(5);  DO_ONE_FLOAT(6);  DO_ONE_FLOAT(7);  \
-    DO_ONE_FLOAT(8);  DO_ONE_FLOAT(9);  DO_ONE_FLOAT(10); DO_ONE_FLOAT(11); \
-    DO_ONE_FLOAT(12); DO_ONE_FLOAT(13); DO_ONE_FLOAT(14); DO_ONE_FLOAT(15); \
-    DO_ONE_FLOAT(16); DO_ONE_FLOAT(17); DO_ONE_FLOAT(18); DO_ONE_FLOAT(19); \
-    DO_ONE_FLOAT(20); DO_ONE_FLOAT(21); DO_ONE_FLOAT(22); DO_ONE_FLOAT(23); \
-    DO_ONE_FLOAT(24); DO_ONE_FLOAT(25); DO_ONE_FLOAT(26); DO_ONE_FLOAT(27); \
-    DO_ONE_FLOAT(28); DO_ONE_FLOAT(29); DO_ONE_FLOAT(30); DO_ONE_FLOAT(31); \
-} while (0)
-
-__mlu_entry__ void gather_rows_loadstore_half_kernel(
+__mlu_entry__ void gather_rows_elem_loadstore_half_kernel(
     const half *input,
     const int64_t *index64,
     half *output
 ) {
-    uint32_t b = taskId;
+    uint32_t tid = taskId;
 
-    if (b >= BATCH) {
+    if (tid >= TOTAL_OUT) {
         return;
     }
 
     const int32_t *index32 = (const int32_t *)index64;
 
-    int in_base = b * N_COL;
-    int idx_base = b * K_COL;
-    int out_base = b * K_COL;
+    int b = tid >> 5;
+    int k = tid & 31;
+    int idx_pos = b * K_COL + k;
 
-    DO_ALL_HALF();
+    int idx = __load_gdram(index32 + (idx_pos << 1));
+    half v = __load_gdram(input + b * N_COL + idx);
+
+    __store_gdram(output + tid, v);
 }
 
-__mlu_entry__ void gather_rows_loadstore_float_kernel(
+__mlu_entry__ void gather_rows_elem_loadstore_float_kernel(
     const float *input,
     const int64_t *index64,
     float *output
 ) {
-    uint32_t b = taskId;
+    uint32_t tid = taskId;
 
-    if (b >= BATCH) {
+    if (tid >= TOTAL_OUT) {
         return;
     }
 
     const int32_t *index32 = (const int32_t *)index64;
 
-    int in_base = b * N_COL;
-    int idx_base = b * K_COL;
-    int out_base = b * K_COL;
+    int b = tid >> 5;
+    int k = tid & 31;
+    int idx_pos = b * K_COL + k;
 
-    DO_ALL_FLOAT();
+    int idx = __load_gdram(index32 + (idx_pos << 1));
+    float v = __load_gdram(input + b * N_COL + idx);
+
+    __store_gdram(output + tid, v);
 }
 
 torch::Tensor bang_func(torch::Tensor input,
@@ -94,23 +66,23 @@ torch::Tensor bang_func(torch::Tensor input,
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {TASK_DIM, 1, 1};
+    cnrtDim3_t dim = {TOTAL_OUT, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        gather_rows_loadstore_half_kernel<<<dim, ktype, queue>>>(
+        gather_rows_elem_loadstore_half_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
             (half*)output.data_ptr<at::Half>()
         );
     } else if (input.scalar_type() == torch::kFloat32) {
-        gather_rows_loadstore_float_kernel<<<dim, ktype, queue>>>(
+        gather_rows_elem_loadstore_float_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
             output.data_ptr<float>()
         );
     } else {
-        TORCH_CHECK(false, "v110_29 supports only float16/float32 input");
+        TORCH_CHECK(false, "v110_30 supports only float16/float32 input");
     }
 
     return output;
