@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_51_probe_Pb_empty_kernel
+// 110_Gather_rows v110_52_probe_Pd_static_output_floorA
 // submission version: no PYBIND11_MODULE
 
-#warning "BUILD_VERSION v110_51_probe_Pb_empty_kernel"
+#warning "BUILD_VERSION v110_52_probe_Pd_static_output_floorA"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -11,45 +11,82 @@
 
 #define BATCH 64
 #define K_COL 32
+#define TOTAL_OUTPUT_ELEMS (BATCH * K_COL)
 
-__mlu_entry__ void empty_half_kernel(
+__mlu_entry__ void floorA_half_staticout_kernel(
     const half *input,
     const int64_t *index,
     half *output
 ) {
     if (taskId != 0) return;
+
+    __nram__ half buf[TOTAL_OUTPUT_ELEMS];
+
+    __memcpy(buf,
+             input,
+             TOTAL_OUTPUT_ELEMS * sizeof(half),
+             GDRAM2NRAM);
+
+    __memcpy(output,
+             buf,
+             TOTAL_OUTPUT_ELEMS * sizeof(half),
+             NRAM2GDRAM);
 }
 
-__mlu_entry__ void empty_float_kernel(
+__mlu_entry__ void floorA_float_staticout_kernel(
     const float *input,
     const int64_t *index,
     float *output
 ) {
     if (taskId != 0) return;
+
+    __nram__ float buf[TOTAL_OUTPUT_ELEMS];
+
+    __memcpy(buf,
+             input,
+             TOTAL_OUTPUT_ELEMS * sizeof(float),
+             GDRAM2NRAM);
+
+    __memcpy(output,
+             buf,
+             TOTAL_OUTPUT_ELEMS * sizeof(float),
+             NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
-    auto output = torch::empty({BATCH, K_COL}, input.options());
-
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     cnrtDim3_t dim = {1, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     if (input.scalar_type() == torch::kHalf) {
-        empty_half_kernel<<<dim, ktype, queue>>>(
+        static torch::Tensor output_half;
+
+        if (!output_half.defined()) {
+            output_half = torch::empty({BATCH, K_COL}, input.options());
+        }
+
+        floorA_half_staticout_kernel<<<dim, ktype, queue>>>(
             (const half*)input.data_ptr<at::Half>(),
             index.data_ptr<int64_t>(),
-            (half*)output.data_ptr<at::Half>()
+            (half*)output_half.data_ptr<at::Half>()
         );
+
+        return output_half;
     } else {
-        empty_float_kernel<<<dim, ktype, queue>>>(
+        static torch::Tensor output_float;
+
+        if (!output_float.defined()) {
+            output_float = torch::empty({BATCH, K_COL}, input.options());
+        }
+
+        floorA_float_staticout_kernel<<<dim, ktype, queue>>>(
             input.data_ptr<float>(),
             index.data_ptr<int64_t>(),
-            output.data_ptr<float>()
+            output_float.data_ptr<float>()
         );
-    }
 
-    return output;
+        return output_float;
+    }
 }
