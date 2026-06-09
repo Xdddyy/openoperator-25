@@ -294,6 +294,25 @@ def test_operator(name, meta, device="mlu"):
         ok = True
         print(f"  精度: 参考输出为空，跳过对比")
 
+    # 确定性验证 (Scatter_add 专用)
+    if name == "Scatter_add" and ok:
+        print("  确定性验证: src=ones(1024,256) index=zeros(1024) ...")
+        N, D, ds = 1024, 256, 512
+        val_src = torch.ones(N, D, device=device)
+        val_idx = torch.zeros(N, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            val_out = bang_func(val_src, val_idx, ds).cpu()
+        expected = torch.zeros(ds, D)
+        expected[0, :] = float(N)
+        val_diff = (val_out - expected).abs().max().item()
+        val_ok = val_diff <= 1e-2
+        val_status = "PASS" if val_ok else "FAIL"
+        print(f"  确定性: max_diff={val_diff:.6f}  [{val_status}]")
+        if not val_ok:
+            print(f"    输出行0前5个值: {val_out[0, :5].tolist()}")
+            print(f"    期望: {expected[0, :5].tolist()}")
+            ok = False
+
     # 性能对比
     if torch_time_ms > 0:
         speedup = torch_time_ms / mlu_time_ms if mlu_time_ms > 0 else float("inf")

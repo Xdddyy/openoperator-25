@@ -7,7 +7,7 @@
 
 __mlu_entry__ void scatter_add_kernel(
     float *src,
-    int *index,
+    int32_t *index,
     float *partial_output,
     int N,
     int D,
@@ -114,7 +114,7 @@ torch::Tensor bang_func(
 
     scatter_add_kernel<<<dim, ktype, queue>>>(
         src_fp32.data_ptr<float>(),
-        index_int32.data_ptr<int>(),
+        index_int32.data_ptr<int32_t>(),
         partial_output.data_ptr<float>(),
         N,
         D,
