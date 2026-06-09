@@ -1,5 +1,5 @@
-// 110_Gather_rows v110_51_probe_spin_sweep_sync
-#warning "BUILD_VERSION v110_51_probe_spin_sweep_sync"
+// 110_Gather_rows v110_52_probe_spin_sweep_no_internal_sync
+#warning "BUILD_VERSION v110_52_probe_spin_sweep_no_internal_sync"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -11,10 +11,9 @@
 #define BATCH 64
 #define K_COL 32
 
-// 扫这个：
-// 0, 1000, 3000, 10000, 30000, 100000, 300000,
-// 1000000, 3000000, 10000000, 30000000
-#define SPIN 1000000
+// 只改这个值扫：
+// 0, 500, 1000, 2000, 4000, 8000, 16000, 32000
+#define SPIN 4000
 
 __mlu_entry__ void spin_half_kernel(
     const half *input,
@@ -25,13 +24,28 @@ __mlu_entry__ void spin_half_kernel(
 
     volatile unsigned int acc = 1u;
 
-    // 用 LCG 风格扰动，避免被识别成简单求和
     for (int i = 0; i < spin; ++i) {
         acc = acc * 1664525u + (unsigned int)i + 1013904223u;
+        acc ^= (acc >> 13);
     }
 
-    // 把 acc 写回 GDRAM，制造可观察副作用
-    // 会破坏正确性，但 probe 只看 latency
+    ((volatile unsigned int*)output)[0] = acc;
+}
+
+__mlu_entry__ void spin_float_kernel(
+    const float *input,
+    float *output,
+    int spin
+) {
+    if (taskId != 0) return;
+
+    volatile unsigned int acc = 1u;
+
+    for (int i = 0; i < spin; ++i) {
+        acc = acc * 1664525u + (unsigned int)i + 1013904223u;
+        acc ^= (acc >> 13);
+    }
+
     ((volatile unsigned int*)output)[0] = acc;
 }
 
@@ -39,38 +53,31 @@ torch::Tensor bang_func(torch::Tensor input, torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cnrtNotifier_t s, e;
-    cnrtNotifierCreate(&s);
-    cnrtNotifierCreate(&e);
-
-    cnrtPlaceNotifier(s, queue);
-
-    spin_half_kernel<<<dim, ktype, queue>>>(
-        (const half*)input.data_ptr<at::Half>(),
-        (half*)output.data_ptr<at::Half>(),
-        SPIN
-    );
-
-    cnrtPlaceNotifier(e, queue);
-
-    // 故意在 bang_func 内 sync
-    // 这样 bangc_us 就直接包含这次 sync 的代价
-    cnrtQueueSync(queue);
-
-    float device_us = -1.0f;
-    cnrtNotifierDuration(s, e, &device_us);
+    if (input.scalar_type() == torch::kHalf) {
+        spin_half_kernel<<<dim, ktype, queue>>>(
+            (const half*)input.data_ptr<at::Half>(),
+            (half*)output.data_ptr<at::Half>(),
+            SPIN
+        );
+    } else if (input.scalar_type() == torch::kFloat32) {
+        spin_float_kernel<<<dim, ktype, queue>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            SPIN
+        );
+    } else {
+        TORCH_CHECK(false, "v110_52 supports only float16/float32 input");
+    }
 
     fprintf(stderr,
-            "[SPIN_SYNC] SPIN=%d device_us=%.3f\n",
+            "[SPIN_NOSYNC] SPIN=%d dtype=%d\n",
             SPIN,
-            device_us);
+            (int)input.scalar_type());
     fflush(stderr);
-
-    cnrtNotifierDestroy(s);
-    cnrtNotifierDestroy(e);
 
     return output;
 }
