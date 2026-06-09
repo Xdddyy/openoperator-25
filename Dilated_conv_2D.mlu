@@ -23,12 +23,11 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int dilation_w)
 {
     // ========================================================================
-    // 多核拆分: 按 (batch, output_channel, output_height) 组合拆分
-    // 确保每个核处理更少的工作，提高精度
+    // 多核拆分: 按 (batch, output_channel) 组合拆分
     // ========================================================================
     uint32_t core_id  = taskId;
     uint32_t core_num = taskDim;
-    uint32_t total_tasks = (uint32_t)(N * C_out * H_out);
+    uint32_t total_tasks = (uint32_t)(N * C_out);
     uint32_t per_core  = total_tasks / core_num;
     uint32_t remainder = total_tasks % core_num;
     uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
@@ -45,60 +44,93 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int out_row_stride    = W_out;
 
     // NRAM 缓冲区
-    __nram__ float nram_out_row[256];  // 单行输出累加器
+    __nram__ float nram_out[256];       // 输出行累加器
 
     // ========================================================================
-    // 每个 core 处理分配给它的 (n, oc, oh) 三元组
+    // 每个 core 处理分配给它的 (n, oc) 对
     // ========================================================================
     for (uint32_t t = 0; t < count; t++) {
         uint32_t task_idx = start + t;
-        int n  = (int)(task_idx / (uint32_t)(C_out * H_out));
-        int rem = (int)(task_idx % (uint32_t)(C_out * H_out));
-        int oc = rem / H_out;
-        int oh = rem % H_out;
+        int n  = (int)(task_idx / (uint32_t)C_out);
+        int oc = (int)(task_idx % (uint32_t)C_out);
 
-        // 清零当前输出行
-        __bang_write_zero(nram_out_row, 256);
-
-        // 对每个输出列 ow
-        for (int ow = 0; ow < W_out; ow++) {
-            float sum = 0.0f;
+        // 逐行处理输出
+        for (int oh = 0; oh < H_out; oh++) {
+            // 清零输出行
+            __bang_write_zero(nram_out, 256);
 
             // 遍历所有输入通道
             for (int ic = 0; ic < C_in; ic++) {
-                // 遍历 kernel 的所有元素
-                for (int kh = 0; kh < kH; kh++) {
-                    int ih = oh * stride_h + kh * dilation_h - padding_h;
+                // 加载 kernel 基址
+                const float* w_base = weight + oc * w_oc_stride + ic * w_ic_stride;
 
-                    for (int kw = 0; kw < kW; kw++) {
-                        int iw = ow * stride_w + kw * dilation_w - padding_w;
+                // 对每个输出列进行精确计算
+                for (int ow = 0; ow < W_out; ow++) {
+                    float sum = 0.0f;
 
-                        // 检查输入坐标是否有效
-                        if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                            // 计算线性索引
-                            int in_idx = n * in_batch_stride + ic * in_channel_stride + ih * in_row_stride + iw;
-                            int w_idx = oc * w_oc_stride + ic * w_ic_stride + kh * kW + kw;
+                    // 对 kernel 中的每个元素
+                    for (int kh = 0; kh < kH; kh++) {
+                        int ih = oh * stride_h + kh * dilation_h - padding_h;
 
-                            // 标量读取和乘加，确保最高精度
-                            float in_val = input[in_idx];
-                            float w_val = weight[w_idx];
-                            sum += in_val * w_val;
+                        for (int kw = 0; kw < kW; kw++) {
+                            int iw = ow * stride_w + kw * dilation_w - padding_w;
+
+                            // 边界检查 - 关键精度修复
+                            if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                                // 计算线性索引并直接读取
+                                int in_idx = n * in_batch_stride + ic * in_channel_stride + ih * in_row_stride + iw;
+                                int w_idx = kh * kW + kw;
+
+                                float in_val = input[in_idx];
+                                float w_val = w_base[w_idx];
+                                sum += in_val * w_val;
+                            }
+                            // 超出边界的输入视为 0，不贡献
                         }
-                        // 否则输入为 0，不贡献
                     }
+
+                    // 累加到输出
+                    nram_out[ow] += sum;
                 }
             }
 
-            // 写入输出
-            nram_out_row[ow] = sum;
+            // 写回 GDRAM
+            int out_idx = n * out_batch_stride + oc * out_oc_stride + oh * out_row_stride;
+            __memcpy(output + out_idx, nram_out, W_out * sizeof(float), NRAM2GDRAM);
         }
-
-        // 计算输出地址并写回 GDRAM
-        int out_idx = n * out_batch_stride + oc * out_oc_stride + oh * out_row_stride;
-        __memcpy(output + out_idx, nram_out_row, W_out * sizeof(float), NRAM2GDRAM);
     }
 }
 
+
+/* ============================================================================
+ * bang_func — 外部调用接口
+ *
+ * 严格匹配 C++ Wrapper 签名:
+ *   torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
+ *       int in_channels, int out_channels, int kernel_size,
+ *       int dilation, int padding);
+ *
+ * 内部行为与 PyTorch nn.Conv2d 对齐:
+ *   - stride = 1 (默认)
+ *   - bias = False (无偏置)
+ *   - dilation / padding 为方形参数
+ *   - 空洞卷积输出尺寸公式:
+ *     H_out = (H + 2*pad - dil*(K-1) - 1) / stride + 1
+ *     W_out = (W + 2*pad - dil*(K-1) - 1) / stride + 1
+ *
+ * 参数:
+ *   x:           输入张量，形状 [batch, in_channels, H, W]
+ *   kernel:      卷积核张量，形状 [out_channels, in_channels, K, K]
+ *   in_channels: 输入通道数
+ *   out_channels:输出通道数
+ *   kernel_size: 卷积核尺寸 K
+ *   dilation:    空洞系数
+ *   padding:     填充宽度
+ *
+ * 返回值:
+ *   卷积输出张量，形状 [batch, out_channels, H_out, W_out]
+ * ============================================================================
+ */
 torch::Tensor bang_func(
     torch::Tensor x,
     torch::Tensor kernel,
@@ -160,7 +192,7 @@ torch::Tensor bang_func(
     // -------- 获取 MLU Stream 并启动 Kernel --------
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 使用 cnrtFuncTypeBlock + 16 个任务
+    // 使用 cnrtFuncTypeBlock + 16 个任务，充分利用 MLU370 的 16 个核心
     cnrtDim3_t dim = {16, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
