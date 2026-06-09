@@ -13,7 +13,7 @@
  *
  * 使用教程 05_matmul 中的 __bang_conv 映射实现 float32 矩阵乘法。
  * A/B/C 按 k 和 m 维分块，避免大矩阵一次性搬入 NRAM/WRAM。
- * B 的每个 k tile 仍保持连续整块搬到 WRAM，避免分散 WRAM tile 引发地址空间错误。
+ * B 的每个 k tile 按教程 conv filter 布局重排到 WRAM。
  * Conv 输出布局为 [n, tile_m, 1]，写回时转置为目标 [m, n]。
  * 返回前转换为 float16，满足题目数据格式要求。
  * ============================================================================
@@ -67,10 +67,34 @@ __mlu_entry__ void batched_matmul_conv_kernel(
                 tile_k = max_k_per_tile;
             }
 
-            __memcpy(wram_B,
-                     B_batch + k_base * n,
-                     tile_k * n * sizeof(float),
-                     GDRAM2WRAM);
+            int wram_idx = 0;
+            int out_channel_blocks = n / 64;
+            if (out_channel_blocks > 0) {
+                for (int group = 0; group < 64; group += 4) {
+                    for (int block = 0; block < out_channel_blocks; block++) {
+                        for (int lane = 0; lane < 4; lane++) {
+                            int col = block * 64 + group + lane;
+                            for (int kk = 0; kk < tile_k; kk++) {
+                                wram_B[wram_idx++] =
+                                    B_batch[(k_base + kk) * n + col];
+                            }
+                        }
+                    }
+                }
+                for (int col = out_channel_blocks * 64; col < n; col++) {
+                    for (int kk = 0; kk < tile_k; kk++) {
+                        wram_B[wram_idx++] =
+                            B_batch[(k_base + kk) * n + col];
+                    }
+                }
+            } else {
+                for (int col = 0; col < n; col++) {
+                    for (int kk = 0; kk < tile_k; kk++) {
+                        wram_B[wram_idx++] =
+                            B_batch[(k_base + kk) * n + col];
+                    }
+                }
+            }
 
             int max_rows_by_a = MAX_MATRIX_ELEMS / tile_k;
             int rows_per_tile = max_rows_by_a < max_rows_by_c
