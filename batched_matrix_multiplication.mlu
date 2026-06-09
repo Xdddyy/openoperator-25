@@ -15,7 +15,7 @@
  * C: [batch_size, m, n]
  *
  * 使用教程 05_matmul 中的 __bang_matmul 实现 float16 输入矩阵乘法。
- * B 的 tile 在 WRAM 中转为列主序，输出 partial float 并在 GDRAM 中累加。
+ * B 的 tile 在 WRAM 中转为列主序，输出 partial half 并在 GDRAM 中累加。
  * 返回前转换为 float16，满足题目数据格式要求。
  * ============================================================================
  */
@@ -40,7 +40,7 @@ __mlu_entry__ void batched_matmul_half_kernel(
 
     __nram__ half nram_A[TILE_M * TILE_K];
     __wram__ half wram_B_col[TILE_N * TILE_K];
-    __nram__ float nram_C[TILE_M * TILE_N];
+    __nram__ half nram_C[TILE_M * TILE_N];
 
     int a_elems = m * k;
     int b_elems = k * n;
@@ -96,7 +96,7 @@ __mlu_entry__ void batched_matmul_half_kernel(
                     for (int row = 0; row < tile_m; row++) {
                         for (int col = 0; col < tile_n; col++) {
                             int out_idx = (row_base + row) * n + col_base + col;
-                            float partial = nram_C[row * tile_n + col];
+                            float partial = (float)nram_C[row * tile_n + col];
                             if (k_base == 0) {
                                 C_batch[out_idx] = partial;
                             } else {
