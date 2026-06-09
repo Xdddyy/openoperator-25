@@ -1,82 +1,20 @@
-// 110_Gather_rows v110_39_ctor_prewarm_current_stream
-// no cnrtQueueCreate, only torch_mlu::getCurMLUStream()
-
-#include <bang.h>
+// v110_40_probe_aten_gather
 #include <torch/extension.h>
-#include <cnrt.h>
 #include <stdint.h>
 #include <cstdio>
-#include "framework/core/MLUStream.h"
 
 #define BATCH 64
 #define K_COL 32
 
-__mlu_entry__ void ctor_empty_kernel() {
-    if (taskId != 0) return;
-}
-
-__mlu_entry__ void empty_half_kernel(
-    const half *input,
-    const int64_t *index,
-    half *output
-) {
-    if (taskId != 0) return;
-}
-
-__mlu_entry__ void empty_float_kernel(
-    const float *input,
-    const int64_t *index,
-    float *output
-) {
-    if (taskId != 0) return;
-}
-
-__attribute__((constructor))
-static void module_ctor_prewarm() {
-    fprintf(stderr, "[CTOR_PREWARM] begin\n");
-    fflush(stderr);
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    fprintf(stderr, "[CTOR_PREWARM] got current stream queue=%p\n", (void*)queue);
-    fflush(stderr);
-
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    for (int i = 0; i < 4; ++i) {
-        ctor_empty_kernel<<<dim, ktype, queue>>>();
-    }
-
-    cnrtQueueSync(queue);
-
-    fprintf(stderr, "[CTOR_PREWARM] end\n");
-    fflush(stderr);
-}
-
 torch::Tensor bang_func(torch::Tensor input, torch::Tensor index) {
-    fprintf(stderr, "[BANG_FUNC] enter dtype=%d\n", (int)input.scalar_type());
+    fprintf(stderr,
+            "[ATEN_PROBE] enter dtype=%d index_dtype=%d\n",
+            (int)input.scalar_type(),
+            (int)index.scalar_type());
     fflush(stderr);
 
-    auto output = torch::empty({BATCH, K_COL}, input.options());
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    if (input.scalar_type() == torch::kHalf) {
-        empty_half_kernel<<<dim, ktype, queue>>>(
-            (const half*)input.data_ptr<at::Half>(),
-            index.data_ptr<int64_t>(),
-            (half*)output.data_ptr<at::Half>()
-        );
-    } else if (input.scalar_type() == torch::kFloat32) {
-        empty_float_kernel<<<dim, ktype, queue>>>(
-            input.data_ptr<float>(),
-            index.data_ptr<int64_t>(),
-            output.data_ptr<float>()
-        );
-    }
-
-    return output;
+    // input: [64,1024]
+    // index: [64,32]
+    // gather dim=1
+    return input.gather(1, index);
 }
