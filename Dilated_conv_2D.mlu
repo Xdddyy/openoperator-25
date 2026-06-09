@@ -3,29 +3,20 @@
 #include <cnrt.h>
 
 /* ============================================================================
- * Dilated Conv2D Kernel — 高性能 NRAM 向量化版本
- *
- * 对四维输入张量 [N, C_in, H, W] 执行带填充和空洞的二维卷积。
+ * Dilated Conv2D Kernel — 高性能 NRAM 向量化版本 v2
  *
  * 关键优化:
- *   1. 多 oc 并行:  一次加载输入 tile，同时计算 OC_GROUP 个输出通道，
- *                   输入数据复用率提升 OC_GROUP 倍
- *   2. 合并 DMA:    每个输入通道只需 1 次 __memcpy (而非逐行 N 次)，
- *                   DMA 调用次数减少 ~100x
- *   3. 精确向量长度: 使用 exact vector length，BANG 硬件自动掩码处理，
- *                   避免对齐填充引入的越界风险
- *   4. NRAM 大 tile: tile_h=64, OC_GROUP=8, 使用 ~300KB NRAM
- *   5. 多核拆分:    按 batch 维度并行，各 core 独立处理不同 batch
- *
- * 输出尺寸 (stride=1):
- *   H_out = H + 2*pad - dil*(K-1)
- *   W_out = W + 2*pad - dil*(K-1)
+ *   1. 多 oc 并行:  输入 tile 被 OC_GROUP 个输出通道共享
+ *   2. 合并 DMA:    每个输入通道 1 次大 __memcpy
+ *   3. 直接累加:    去掉 row_acc 中间缓冲, 直接累加到 nram_out
+ *   4. 预计算:      kw 参数/kh 偏移 在循环外预计算为数组
+ *   5. kh-oh 反转:  按 kh 筛选有效 oh 范围, 消除逐 oh 的 ih 边界检查
+ *   6. 权重预加载:  每个 (oc_group, ic) 的权重一次性加载到 NRAM
+ *   7. 多核拆分:    按 batch 并行
  * ============================================================================
  */
 
-// 一次并行计算的输出通道数
 #define OC_GROUP  8
-// H 维度 tile 高度
 #define H_TILE    64
 
 __mlu_entry__ void dilated_conv2d_kernel(
@@ -49,7 +40,7 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int dilation_w)
 {
     // ========================================================================
-    // 多核拆分: 按 batch 维度拆分, 各 core 处理若干 batch 的全部输出通道
+    // 多核拆分: 按 batch 维度
     // ========================================================================
     uint32_t core_id  = taskId;
     uint32_t core_num = taskDim;
@@ -68,15 +59,35 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int out_batch_stride  = C_out * H_out * W_out;
     int out_oc_stride     = H_out * W_out;
 
-    // ---- NRAM 缓冲区声明 (函数顶层, 各 tile 复用) ----
-    // 最大输入行数: H_TILE + (kH-1)*dil ≤ 64+4=68, 上限 H=128 → 取 68*128=8704
-    // 最大输出尺寸: OC_GROUP * H_TILE * W_out = 8*64*128 = 65536
-    // row 临时: 2 * W_out = 256
-    // 总计 ≤ 8704+65536+256 = 74496, 远小于 512KB (131072 floats)
-    __nram__ float nram_in[8704];     // 输入 tile (最多 68 行 × 128 列)
-    __nram__ float nram_out[65536];   // 输出累加器 (OC_GROUP × H_TILE × W_out)
-    __nram__ float nram_row_acc[128]; // 单行累加器
-    __nram__ float nram_row_tmp[128]; // 单行乘法临时缓冲
+    // ---- NRAM 缓冲区 ----
+    __nram__ float nram_in[8704];       // 输入 tile
+    __nram__ float nram_out[65536];     // 输出累加器
+    __nram__ float nram_weight[72];     // OC_GROUP × K×K 权重缓冲
+    __nram__ float nram_tmp[64];        // mul_scalar 临时缓冲 (64 = ALIGN)
+
+    // ========================================================================
+    // 预计算 kw 参数 (与 W/W_out/dil/pad 相关, 全 tile 不变)
+    // ========================================================================
+    int kw_iw_offset[3], kw_ow_start[3], kw_ow_end[3];
+    int kw_valid_w[3], kw_iw_start[3];
+    for (int kw = 0; kw < kW; kw++) {
+        int iw_off = kw * dilation_w - padding_w;
+        kw_iw_offset[kw] = iw_off;
+        int os = -iw_off;
+        kw_ow_start[kw] = (os < 0) ? 0 : os;
+        int oe = W - iw_off;
+        kw_ow_end[kw]   = (oe > W_out) ? W_out : oe;
+        kw_valid_w[kw]  = kw_ow_end[kw] - kw_ow_start[kw];
+        kw_iw_start[kw] = kw_ow_start[kw] + iw_off;
+    }
+
+    // 预计算 kh 的 ih 偏移
+    int kh_ih_offset[3];
+    for (int kh = 0; kh < kH; kh++) {
+        kh_ih_offset[kh] = kh * dilation_h - padding_h;
+    }
+
+    int KW = kW;  // kernel width
 
     // ========================================================================
     // 每个 core 处理分配给它的 batch 范围
@@ -84,25 +95,21 @@ __mlu_entry__ void dilated_conv2d_kernel(
     for (uint32_t nb = 0; nb < n_count; nb++) {
         int n = (int)(n_start + nb);
 
-        // ---- 按 OC_GROUP 分组处理输出通道 ----
+        // ---- 按 OC_GROUP 分组 ----
         for (int oc_grp = 0; oc_grp < C_out; oc_grp += OC_GROUP) {
             int oc_end = oc_grp + OC_GROUP;
             if (oc_end > C_out) oc_end = C_out;
             int cur_oc = oc_end - oc_grp;
 
-            // ---- 按 H_TILE 分块处理 H 维度 ----
-            int tile_h_use = H_TILE;
+            // ---- 按 H_TILE 分块 ----
             for (int oh_tile_start = 0; oh_tile_start < H_out;
-                 oh_tile_start += tile_h_use) {
+                 oh_tile_start += H_TILE) {
 
-                int oh_tile_end = oh_tile_start + tile_h_use;
+                int oh_tile_end = oh_tile_start + H_TILE;
                 if (oh_tile_end > H_out) oh_tile_end = H_out;
                 int cur_tile_h = oh_tile_end - oh_tile_start;
 
-                // ---- 计算该 tile 需要的输入行范围 ----
-                // ih = oh * stride_h + kh * dilation_h - padding_h
-                // 最上方的输入行: oh_tile_start - pad (kh=0, worst -pad)
-                // 最下方的输入行: (oh_tile_end-1) + (kH-1)*dil - pad (kh=kH-1)
+                // ---- 输入行范围 ----
                 int load_ih_start = oh_tile_start * stride_h - padding_h;
                 if (load_ih_start < 0) load_ih_start = 0;
                 if (load_ih_start > H) load_ih_start = H;
@@ -116,118 +123,114 @@ __mlu_entry__ void dilated_conv2d_kernel(
 
                 int out_tile_size = cur_oc * cur_tile_h * W_out;
 
-                // ---- 清零该 tile 的输出累加器 ----
+                // ---- 清零输出累加器 ----
                 __bang_write_zero(nram_out, out_tile_size);
 
-                // ====================================================
+                // ================================================
                 // 遍历所有输入通道 ic
-                // ====================================================
+                // ================================================
                 for (int ic = 0; ic < C_in; ic++) {
-                    const float* in_ch_base =
-                        input + n * in_batch_stride + ic * in_channel_stride;
-
-                    // ---- 一次 DMA 加载该 ic 所有需要的行 ----
-                    // 输入行在 GDRAM 中连续存储
+                    // 加载输入 tile (一次 DMA)
                     __memcpy(
                         nram_in,
-                        in_ch_base + load_ih_start * W,
+                        input + n * in_batch_stride
+                              + ic * in_channel_stride
+                              + load_ih_start * W,
                         num_in_rows * W * sizeof(float),
                         GDRAM2NRAM);
 
-                    // ================================================
-                    // 为该 ic 计算它对 tile 内所有 oc 的贡献
-                    // ================================================
+                    // ---- 预加载该 ic 对应所有 oc 的权重到 NRAM ----
                     for (int oc_local = 0; oc_local < cur_oc; oc_local++) {
                         int oc = oc_grp + oc_local;
-                        const float* w_base =
-                            weight + oc * w_oc_stride + ic * w_ic_stride;
+                        const float* w_src = weight + oc * w_oc_stride
+                                             + ic * w_ic_stride;
+                        float* w_dst = nram_weight + oc_local * kH * KW;
+                        for (int k = 0; k < kH * KW; k++) {
+                            w_dst[k] = w_src[k];
+                        }
+                    }
 
-                        float* nram_out_oc =
-                            nram_out + oc_local * cur_tile_h * W_out;
+                    // ================================================
+                    // 遍历 kernel 行 kh: 按有效 oh 范围处理
+                    // ================================================
+                    for (int kh = 0; kh < kH; kh++) {
+                        int ih_offset = kh_ih_offset[kh];
 
-                        // ---- 逐输出行 ----
-                        for (int oh = oh_tile_start; oh < oh_tile_end; oh++) {
-                            int nram_out_row = oh - oh_tile_start;
+                        // 该 kh 的有效 oh 范围: ih ∈ [0, H)
+                        int oh_start_kh = oh_tile_start;
+                        int oh_end_kh   = oh_tile_end;
+                        int min_oh = -ih_offset;          // stride=1
+                        if (min_oh > oh_start_kh)
+                            oh_start_kh = min_oh;
+                        int max_oh = H - ih_offset;
+                        if (max_oh < oh_end_kh)
+                            oh_end_kh = max_oh;
+                        if (oh_start_kh >= oh_end_kh) continue;
 
-                            // Step 1: 清零行累加器 (精确 W_out 长度)
-                            __bang_write_zero(nram_row_acc, W_out);
+                        // 第一个有效 oh 对应的 NRAM 指针基址
+                        int in_row_first = oh_start_kh * stride_h
+                                           + ih_offset
+                                           - load_ih_start;
+                        int out_row_first = oh_start_kh - oh_tile_start;
+                        int oh_count = oh_end_kh - oh_start_kh;
+                        int in_step  = stride_h * W;   // 输入行步长
+                        int out_step = W_out;           // 输出行步长
 
-                            // Step 2: 遍历 (kh, kw), 累加到行缓冲
-                            for (int kh = 0; kh < kH; kh++) {
-                                int ih = oh * stride_h
-                                         + kh * dilation_h
-                                         - padding_h;
-                                if (ih < 0 || ih >= H) continue;
+                        for (int kw = 0; kw < kW; kw++) {
+                            int ow_start = kw_ow_start[kw];
+                            int valid_w  = kw_valid_w[kw];
+                            if (valid_w <= 0) continue;
+                            int iw_start = kw_iw_start[kw];
 
-                                int nram_in_row = ih - load_ih_start;
+                            // oc 外层: w_val 只读一次 per (oc,kh,kw)
+                            for (int oc_local = 0;
+                                 oc_local < cur_oc; oc_local++) {
 
-                                for (int kw = 0; kw < kW; kw++) {
-                                    float w_val = w_base[kh * kW + kw];
-                                    if (w_val == 0.0f) continue;
+                                float w_val = nram_weight[
+                                    oc_local * kH * KW + kh * KW + kw];
 
-                                    int iw_offset = kw * dilation_w
-                                                    - padding_w;
+                                float* out_oc_base = nram_out
+                                    + oc_local * cur_tile_h * W_out;
 
-                                    // ow_start: 该 kw 对应的最小有效输出列
-                                    int ow_start = 0 - iw_offset;
-                                    if (ow_start < 0) ow_start = 0;
+                                // 沿 oh 方向滑动指针
+                                float* in_ptr = nram_in
+                                    + in_row_first * W + iw_start;
+                                float* dst    = out_oc_base
+                                    + out_row_first * W_out + ow_start;
 
-                                    // ow_end: 该 kw 对应的最大有效输出列+1
-                                    int ow_end = W - iw_offset;
-                                    if (ow_end > W_out) ow_end = W_out;
-
-                                    int valid_w = ow_end - ow_start;
-                                    if (valid_w <= 0) continue;
-
-                                    // iw_start: 第一个有效输入列
-                                    int iw_start = ow_start + iw_offset;
-
-                                    // row_tmp[0:valid_w] =
-                                    //   w_val * input[ih][iw_start:iw_start+valid_w]
-                                    // 使用精确长度, BANG 硬件自动掩码
-                                    __bang_mul_scalar(
-                                        nram_row_tmp,
-                                        nram_in + nram_in_row * W
-                                                + iw_start,
-                                        w_val,
-                                        valid_w);
-
-                                    // row_acc[ow_start:ow_start+valid_w] +=
-                                    //   row_tmp[0:valid_w]
-                                    __bang_add(
-                                        nram_row_acc + ow_start,
-                                        nram_row_acc + ow_start,
-                                        nram_row_tmp,
-                                        valid_w);
+                                for (int t = 0; t < oh_count; t++) {
+                                    // ---- 按 64 元素分块, 保证对齐安全 ----
+                                    int rem = valid_w;
+                                    int cur_ow = 0;
+                                    int cur_iw = 0;
+                                    while (rem > 0) {
+                                        int chunk = (rem > 64) ? 64 : rem;
+                                        __bang_mul_scalar(nram_tmp,
+                                            in_ptr + cur_iw, w_val, chunk);
+                                        __bang_add(dst + cur_ow,
+                                            dst + cur_ow, nram_tmp, chunk);
+                                        rem -= chunk;
+                                        cur_ow += chunk;
+                                        cur_iw += chunk;
+                                    }
+                                    in_ptr += in_step;
+                                    dst    += out_step;
                                 }
                             }
-
-                            // Step 3: 将该行合并结果一次累加到 nram_out
-                            __bang_add(
-                                nram_out_oc + nram_out_row * W_out,
-                                nram_out_oc + nram_out_row * W_out,
-                                nram_row_acc,
-                                W_out);
                         }
                     }
                 }
 
-                // ====================================================
-                // 将该 tile 的累加结果写回 GDRAM
-                // 每个 oc 的 tile 数据在 NRAM 和 GDRAM 中均连续，
-                // 合并为一次大 DMA 传输
-                // ====================================================
+                // ================================================
+                // 写回 GDRAM (每个 oc 一次大 DMA)
+                // ================================================
                 for (int oc_local = 0; oc_local < cur_oc; oc_local++) {
                     int oc = oc_grp + oc_local;
-                    float* out_gdram = output + n * out_batch_stride
-                                       + oc * out_oc_stride
-                                       + oh_tile_start * W_out;
-                    float* nram_out_oc =
-                        nram_out + oc_local * cur_tile_h * W_out;
-
                     __memcpy(
-                        out_gdram,
-                        nram_out_oc,
+                        output + n * out_batch_stride
+                               + oc * out_oc_stride
+                               + oh_tile_start * W_out,
+                        nram_out + oc_local * cur_tile_h * W_out,
                         cur_tile_h * W_out * sizeof(float),
                         NRAM2GDRAM);
                 }
