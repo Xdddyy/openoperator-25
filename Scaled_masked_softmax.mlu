@@ -11,67 +11,49 @@
 #define TOTAL_ELEMS (BATCH * HEADS * Q_LEN * K_LEN)
 
 #define ZERO_CHUNK 8192
-#define TASK_DIM 4
 
-#define PROCESS_FLOAT_AN(AN) do {                                   \
-    __memcpy(row, src, n * sizeof(float), GDRAM2NRAM);               \
-                                                                     \
-    for (int j = n; j < (AN); ++j) {                                 \
-        row[j] = 0.0f;                                               \
-    }                                                                \
-                                                                     \
-    if (scale_val != 1.0f) {                                         \
-        __bang_mul_const(row, row, scale_val, (AN));                 \
-    }                                                                \
-                                                                     \
-    __bang_active_exp(row, row, (AN));                               \
-                                                                     \
-    for (int j = n; j < (AN); ++j) {                                 \
-        row[j] = 0.0f;                                               \
-    }                                                                \
-                                                                     \
-    __bang_reduce_sum(tmp, row, (AN));                               \
-                                                                     \
-    float sum_val = tmp[0];                                          \
-    if ((AN) > 32) sum_val += tmp[32];                               \
-    if ((AN) > 64) sum_val += tmp[64];                               \
-    if ((AN) > 96) sum_val += tmp[96];                               \
-                                                                     \
-    float inv_sum = 1.0f / sum_val;                                  \
-    __bang_mul_const(row, row, inv_sum, (AN));                       \
-                                                                     \
-    __memcpy(dst, row, n * sizeof(float), NRAM2GDRAM);               \
+#define PROCESS_RAW_AN(AN) do {                                      \
+    __memcpy(row,                                                     \
+             src,                                                     \
+             n * sizeof(float),                                       \
+             GDRAM2NRAM);                                             \
+                                                                       \
+    /* padding 先填 0，exphp 后再清 0，不参与 sum */                    \
+    for (int j = n; j < (AN); ++j) {                                  \
+        row[j] = 0.0f;                                                \
+    }                                                                  \
+                                                                       \
+    /* no-max raw exp: exp(logits) */                                  \
+    __bang_active_exphp(row, row, (AN));                               \
+                                                                       \
+    for (int j = n; j < (AN); ++j) {                                  \
+        row[j] = 0.0f;                                                \
+    }                                                                  \
+                                                                       \
+    __bang_reduce_sum(tmp, row, (AN));                                 \
+                                                                       \
+    float sum_val = tmp[0];                                           \
+    if ((AN) > 32) {                                                   \
+        sum_val += tmp[32];                                           \
+    }                                                                  \
+    if ((AN) > 64) {                                                   \
+        sum_val += tmp[64];                                           \
+    }                                                                  \
+    if ((AN) > 96) {                                                   \
+        sum_val += tmp[96];                                           \
+    }                                                                  \
+                                                                       \
+    float inv_sum = 1.0f / sum_val;                                   \
+    __bang_mul_const(row, row, inv_sum, (AN));                         \
+                                                                       \
+    /* output 已经全局清零，只写有效 causal 区 */                        \
+    __memcpy(dst,                                                      \
+             row,                                                      \
+             n * sizeof(float),                                        \
+             NRAM2GDRAM);                                              \
 } while (0)
 
-#define PROCESS_HALF_AN(AN) do {                                     \
-    __memcpy(row, src, n * sizeof(half), GDRAM2NRAM);                \
-                                                                     \
-    for (int j = n; j < (AN); ++j) {                                 \
-        row[j] = (half)0.0f;                                         \
-    }                                                                \
-                                                                     \
-    if (scale_val != 1.0f) {                                         \
-        __bang_mul_const(row, row, scale_val, (AN));                 \
-    }                                                                \
-                                                                     \
-    __bang_active_exphp(row, row, (AN));                             \
-                                                                     \
-    for (int j = n; j < (AN); ++j) {                                 \
-        row[j] = (half)0.0f;                                         \
-    }                                                                \
-                                                                     \
-    __bang_reduce_sum(tmp, row, (AN));                               \
-                                                                     \
-    float sum_val = (float)tmp[0];                                   \
-    if ((AN) > 64) sum_val += (float)tmp[64];                        \
-                                                                     \
-    float inv_sum = 1.0f / sum_val;                                  \
-    __bang_mul_const(row, row, inv_sum, (AN));                       \
-                                                                     \
-    __memcpy(dst, row, n * sizeof(half), NRAM2GDRAM);                \
-} while (0)
-
-__mlu_entry__ void zero_output_float_kernel(float *output) {
+__mlu_entry__ void zero_output_kernel_v25(float *output) {
     uint32_t tid = taskId;
     uint32_t tnum = taskDim;
 
@@ -81,11 +63,16 @@ __mlu_entry__ void zero_output_float_kernel(float *output) {
     int per = (TOTAL_ELEMS + tnum - 1) / tnum;
     int start = tid * per;
     int end = start + per;
-    if (end > TOTAL_ELEMS) end = TOTAL_ELEMS;
+
+    if (end > TOTAL_ELEMS) {
+        end = TOTAL_ELEMS;
+    }
 
     for (int pos = start; pos < end; pos += ZERO_CHUNK) {
         int len = end - pos;
-        if (len > ZERO_CHUNK) len = ZERO_CHUNK;
+        if (len > ZERO_CHUNK) {
+            len = ZERO_CHUNK;
+        }
 
         __memcpy(output + pos,
                  z,
@@ -94,33 +81,9 @@ __mlu_entry__ void zero_output_float_kernel(float *output) {
     }
 }
 
-__mlu_entry__ void zero_output_half_kernel(half *output) {
-    uint32_t tid = taskId;
-    uint32_t tnum = taskDim;
-
-    __nram__ half z[ZERO_CHUNK];
-    __bang_write_zero(z, ZERO_CHUNK);
-
-    int per = (TOTAL_ELEMS + tnum - 1) / tnum;
-    int start = tid * per;
-    int end = start + per;
-    if (end > TOTAL_ELEMS) end = TOTAL_ELEMS;
-
-    for (int pos = start; pos < end; pos += ZERO_CHUNK) {
-        int len = end - pos;
-        if (len > ZERO_CHUNK) len = ZERO_CHUNK;
-
-        __memcpy(output + pos,
-                 z,
-                 len * sizeof(half),
-                 NRAM2GDRAM);
-    }
-}
-
-__mlu_entry__ void scaled_masked_softmax_float_kernel(
+__mlu_entry__ void scaled_masked_softmax_v25_kernel(
     const float *attn_weight,
-    float *output,
-    float scale_val
+    float *output
 ) {
     uint32_t tid = taskId;
     uint32_t tnum = taskDim;
@@ -128,73 +91,31 @@ __mlu_entry__ void scaled_masked_softmax_float_kernel(
     __nram__ float row[K_LEN];
     __nram__ float tmp[K_LEN];
 
-    int rows_per_task = (ROWS + tnum - 1) / tnum;
-    int r_start = tid * rows_per_task;
-    int r_end = r_start + rows_per_task;
-    if (r_end > ROWS) r_end = ROWS;
-
-    for (int r = r_start; r < r_end; ++r) {
+    for (int r = tid; r < ROWS; r += tnum) {
         int q = r & 127;
         int n = q + 1;
 
         const float *src = attn_weight + r * K_LEN;
         float *dst = output + r * K_LEN;
 
+        // output 已经全局清零；q=0 softmax([x]) = 1
         if (q == 0) {
             row[0] = 1.0f;
-            __memcpy(dst, row, sizeof(float), NRAM2GDRAM);
+            __memcpy(dst,
+                     row,
+                     sizeof(float),
+                     NRAM2GDRAM);
             continue;
         }
 
         if (q < 32) {
-            PROCESS_FLOAT_AN(32);
+            PROCESS_RAW_AN(32);
         } else if (q < 64) {
-            PROCESS_FLOAT_AN(64);
+            PROCESS_RAW_AN(64);
         } else if (q < 96) {
-            PROCESS_FLOAT_AN(96);
+            PROCESS_RAW_AN(96);
         } else {
-            PROCESS_FLOAT_AN(128);
-        }
-    }
-}
-
-__mlu_entry__ void scaled_masked_softmax_half_kernel(
-    const half *attn_weight,
-    half *output,
-    float scale_val
-) {
-    uint32_t tid = taskId;
-    uint32_t tnum = taskDim;
-
-    __nram__ half row[K_LEN];
-    __nram__ half tmp[K_LEN];
-
-    int rows_per_task = (ROWS + tnum - 1) / tnum;
-    int r_start = tid * rows_per_task;
-    int r_end = r_start + rows_per_task;
-    if (r_end > ROWS) r_end = ROWS;
-
-    for (int r = r_start; r < r_end; ++r) {
-        int q = r & 127;
-        int n = q + 1;
-
-        const half *src = attn_weight + r * K_LEN;
-        half *dst = output + r * K_LEN;
-
-        if (q == 0) {
-            row[0] = (half)1.0f;
-            __memcpy(dst, row, sizeof(half), NRAM2GDRAM);
-            continue;
-        }
-
-        if (q < 32) {
-            PROCESS_HALF_AN(32);
-        } else if (q < 64) {
-            PROCESS_HALF_AN(64);
-        } else if (q < 96) {
-            PROCESS_HALF_AN(96);
-        } else {
-            PROCESS_HALF_AN(128);
+            PROCESS_RAW_AN(128);
         }
     }
 }
@@ -202,13 +123,6 @@ __mlu_entry__ void scaled_masked_softmax_half_kernel(
 torch::Tensor bang_func(torch::Tensor attn_weight,
                         torch::Tensor mask,
                         double scale) {
-    TORCH_CHECK(attn_weight.is_contiguous(), "attn_weight must be contiguous");
-    TORCH_CHECK(attn_weight.dim() == 4, "attn_weight must be 4D");
-    TORCH_CHECK(attn_weight.size(0) == BATCH, "121 assumes batch=4");
-    TORCH_CHECK(attn_weight.size(1) == HEADS, "121 assumes heads=8");
-    TORCH_CHECK(attn_weight.size(2) == Q_LEN, "121 assumes q_len=128");
-    TORCH_CHECK(attn_weight.size(3) == K_LEN, "121 assumes k_len=128");
-
     auto output = torch::empty(
         {BATCH, HEADS, Q_LEN, K_LEN},
         attn_weight.options()
@@ -216,34 +130,21 @@ torch::Tensor bang_func(torch::Tensor attn_weight,
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {TASK_DIM, 1, 1};
+    cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    float scale_val = (float)scale;
+    zero_output_kernel_v25<<<dim, ktype, queue>>>(
+        output.data_ptr<float>()
+    );
 
-    if (attn_weight.scalar_type() == torch::kFloat32) {
-        zero_output_float_kernel<<<dim, ktype, queue>>>(
-            output.data_ptr<float>()
-        );
-
-        scaled_masked_softmax_float_kernel<<<dim, ktype, queue>>>(
-            attn_weight.data_ptr<float>(),
-            output.data_ptr<float>(),
-            scale_val
-        );
-    } else if (attn_weight.scalar_type() == torch::kHalf) {
-        zero_output_half_kernel<<<dim, ktype, queue>>>(
-            (half*)output.data_ptr<at::Half>()
-        );
-
-        scaled_masked_softmax_half_kernel<<<dim, ktype, queue>>>(
-            (const half*)attn_weight.data_ptr<at::Half>(),
-            (half*)output.data_ptr<at::Half>(),
-            scale_val
-        );
-    } else {
-        TORCH_CHECK(false, "121 supports only float32/float16 attn_weight");
-    }
+    scaled_masked_softmax_v25_kernel<<<dim, ktype, queue>>>(
+        attn_weight.data_ptr<float>(),
+        output.data_ptr<float>()
+    );
 
     return output;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "Scaled_masked_softmax");
 }
