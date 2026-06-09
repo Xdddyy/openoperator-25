@@ -1,0 +1,139 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+#define CORE_NUM 4
+
+__mlu_entry__ void scatter_add_kernel(
+    float *src,
+    int *index,
+    float *partial_output,
+    int N,
+    int D,
+    int dim_size) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = N / core_num;
+    uint32_t remainder = N % core_num;
+
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    float *local_out = partial_output + core_id * dim_size * D;
+
+    __nram__ float nram_src[CHUNK_SIZE];
+    __nram__ float nram_dst[CHUNK_SIZE];
+
+    for (uint32_t i = 0; i < count; i++) {
+        int idx = index[start + i];
+        float *src_row = src + (start + i) * D;
+        float *dst_row = local_out + idx * D;
+
+        for (int d = 0; d < D; d += CHUNK_SIZE) {
+
+            int chunk =
+                (d + CHUNK_SIZE <= D)
+                    ? CHUNK_SIZE
+                    : (D - d);
+
+            __memcpy(
+                nram_src,
+                src_row + d,
+                chunk * sizeof(float),
+                GDRAM2NRAM);
+
+            __memcpy(
+                nram_dst,
+                dst_row + d,
+                chunk * sizeof(float),
+                GDRAM2NRAM);
+
+            for (int p = chunk; p < CHUNK_SIZE; p++) {
+                nram_src[p] = 0.0f;
+            }
+
+            __bang_add(
+                nram_dst,
+                nram_dst,
+                nram_src,
+                CHUNK_SIZE);
+
+            __memcpy(
+                dst_row + d,
+                nram_dst,
+                chunk * sizeof(float),
+                NRAM2GDRAM);
+        }
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor src,
+    torch::Tensor index,
+    int64_t dim_size) {
+
+    TORCH_CHECK(
+        src.is_contiguous(),
+        "src must be contiguous");
+    TORCH_CHECK(
+        index.is_contiguous(),
+        "index must be contiguous");
+
+    auto original_dtype = src.scalar_type();
+
+    torch::Tensor src_fp32 = src;
+    if (original_dtype != torch::kFloat) {
+        src_fp32 = src.to(torch::kFloat);
+    }
+
+    auto index_int32 = index.to(torch::kInt32);
+
+    int N = src_fp32.size(0);
+    int D = src_fp32.size(1);
+    int ds = (int)dim_size;
+
+    auto partial_output = torch::zeros(
+        {CORE_NUM * ds * D},
+        torch::TensorOptions()
+            .dtype(torch::kFloat)
+            .device(src_fp32.device()));
+
+    cnrtQueue_t queue = nullptr;
+
+    cnrtDim3_t dim = {CORE_NUM, 1, 1};
+    cnrtFunctionType_t ktype =
+        cnrtFuncTypeUnion1;
+
+    scatter_add_kernel<<<dim, ktype, queue>>>(
+        src_fp32.data_ptr<float>(),
+        index_int32.data_ptr<int>(),
+        partial_output.data_ptr<float>(),
+        N,
+        D,
+        ds);
+
+    auto partial_cpu = partial_output.cpu();
+    auto output = torch::zeros({ds, D}, torch::kFloat);
+    auto output_acc = output.accessor<float, 2>();
+
+    for (int c = 0; c < CORE_NUM; c++) {
+        float *core_data = partial_cpu.data_ptr<float>() + c * ds * D;
+        for (int r = 0; r < ds; r++) {
+            for (int d = 0; d < D; d++) {
+                output_acc[r][d] += core_data[r * D + d];
+            }
+        }
+    }
+
+    if (original_dtype != torch::kFloat) {
+        output = output.to(original_dtype);
+    }
+
+    return output.to(src.device());
+}

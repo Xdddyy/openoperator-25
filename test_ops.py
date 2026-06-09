@@ -60,6 +60,21 @@ OPS_META = {
         "shape": (1024, 256),
         "extra": {},
     },
+    "Scatter_add": {
+        "file": "Scatter_add.mlu",
+        "args": ["src", "index", "dim_size"],
+        "ref": lambda src, idx, ds: torch.zeros(ds, src.size(1))
+        .index_add_(0, idx.to(torch.int32) % ds, src),
+        "shape": (1024, 256),
+        "extra": {"dim_size": 512},
+    },
+    "PointwiseConv2d": {
+        "file": "PointwiseConv2d.mlu",
+        "args": ["x", "weight", "bias"],
+        "ref": lambda x, w, b=None: torch.nn.functional.conv2d(x, w, b),
+        "shape": [(2, 64, 32, 32), (128, 64, 1, 1)],
+        "extra": {"bias": None},
+    },
 }
 
 # config 中三位编号 -> 算子名的映射
@@ -67,6 +82,7 @@ NUM_TO_NAME = {
     "001": "LeakyReLU",
     "070": "Sqrt",
     "103": "MSE_Loss",
+    "104": "PointwiseConv2d",
 }
 
 
@@ -216,7 +232,10 @@ def test_operator(name, meta, device="mlu"):
 
     # 生成测试数据
     torch.manual_seed(42)
-    inputs_cpu = [torch.randn(*shape) for _ in range(len(args) - len(extra))]
+    if isinstance(shape, list):
+        inputs_cpu = [torch.randn(*s) for s in shape]
+    else:
+        inputs_cpu = [torch.randn(*shape) for _ in range(len(args) - len(extra))]
     inputs_mlu = [t.to(device) for t in inputs_cpu]
 
     # 运行 MLU kernel（预热 + 计时）

@@ -1,0 +1,169 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void pointwise_conv2d_kernel(
+    float *x,
+    float *weight,
+    float *bias,
+    float *output,
+    int B,
+    int C,
+    int H,
+    int W,
+    int K,
+    int total_out) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total_out / core_num;
+    uint32_t remainder = total_out % core_num;
+
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
+
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_x[CHUNK_SIZE];
+    __nram__ float nram_w[CHUNK_SIZE];
+    __nram__ float nram_mul[CHUNK_SIZE];
+    __nram__ float nram_scalar[1];
+
+    for (uint32_t idx = 0; idx < count; idx++) {
+        uint32_t g = start + idx;
+
+        uint32_t b = g / (K * H * W);
+        uint32_t r = g % (K * H * W);
+        uint32_t k = r / (H * W);
+        uint32_t s = r % (H * W);
+        uint32_t h = s / W;
+        uint32_t w = s % W;
+
+        float acc = (bias != nullptr) ? bias[k] : 0.0f;
+
+        uint32_t x_base = b * C * H * W + h * W + w;
+        uint32_t w_base = k * C;
+
+        for (uint32_t c = 0; c < C; c += CHUNK_SIZE) {
+            uint32_t c_len =
+                (c + CHUNK_SIZE <= C) ? CHUNK_SIZE : (C - c);
+            uint32_t aligned_len = (c_len + 63) & ~63;
+
+            for (uint32_t j = 0; j < c_len; j++) {
+                __memcpy(
+                    nram_x + j,
+                    x + x_base + (c + j) * H * W,
+                    sizeof(float),
+                    GDRAM2NRAM);
+            }
+            for (uint32_t j = c_len; j < aligned_len; j++) {
+                nram_x[j] = 0.0f;
+            }
+
+            __memcpy(
+                nram_w,
+                weight + w_base + c,
+                c_len * sizeof(float),
+                GDRAM2NRAM);
+            for (uint32_t j = c_len; j < aligned_len; j++) {
+                nram_w[j] = 0.0f;
+            }
+
+            __bang_mul(nram_mul, nram_x, nram_w, aligned_len);
+
+            for (uint32_t j = 0; j < c_len; j++) {
+                acc += nram_mul[j];
+            }
+        }
+
+        nram_scalar[0] = acc;
+        __memcpy(
+            output + b * K * H * W + k * H * W + h * W + w,
+            nram_scalar,
+            sizeof(float),
+            NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor weight,
+    c10::optional<torch::Tensor> bias) {
+
+    TORCH_CHECK(
+        x.is_contiguous(),
+        "x must be contiguous");
+    TORCH_CHECK(
+        weight.is_contiguous(),
+        "weight must be contiguous");
+
+    int B = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int K = weight.size(0);
+
+    TORCH_CHECK(
+        weight.size(1) == C,
+        "weight in_channels must match x");
+    TORCH_CHECK(
+        weight.size(2) == 1 && weight.size(3) == 1,
+        "weight must be 1x1 kernel");
+
+    auto original_dtype = x.scalar_type();
+
+    torch::Tensor x_fp32 = x;
+    torch::Tensor w_fp32 = weight;
+    bool has_bias = bias.has_value();
+
+    if (original_dtype != torch::kFloat) {
+        x_fp32 = x.to(torch::kFloat);
+        w_fp32 = weight.to(torch::kFloat);
+    }
+
+    torch::Tensor b_fp32;
+    if (has_bias) {
+        b_fp32 = bias.value();
+        if (b_fp32.scalar_type() != torch::kFloat) {
+            b_fp32 = b_fp32.to(torch::kFloat);
+        }
+        TORCH_CHECK(
+            b_fp32.is_contiguous(),
+            "bias must be contiguous");
+        TORCH_CHECK(
+            b_fp32.size(0) == K,
+            "bias size must match out_channels");
+    }
+
+    auto output_fp32 = torch::empty(
+        {B, K, H, W},
+        torch::TensorOptions()
+            .dtype(torch::kFloat)
+            .device(x_fp32.device()));
+
+    int total_out = B * K * H * W;
+
+    cnrtQueue_t queue = nullptr;
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    float *bias_ptr = has_bias ? b_fp32.data_ptr<float>() : nullptr;
+
+    pointwise_conv2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        w_fp32.data_ptr<float>(),
+        bias_ptr,
+        output_fp32.data_ptr<float>(),
+        B, C, H, W, K,
+        total_out);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+
+    return output_fp32;
+}
