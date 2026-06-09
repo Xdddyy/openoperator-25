@@ -1,0 +1,109 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+/* ============================================================================
+ * Unfold / im2col
+ *
+ * input:  [N, C, H, W]
+ * output: [N, C * K * K, H_out * W_out]
+ *
+ * Layout matches torch.nn.Unfold(kernel_size=K, stride=stride, padding=padding).
+ * ============================================================================
+ */
+__mlu_entry__ void unfold_kernel(
+    const half *input,
+    half *output,
+    int N,
+    int C,
+    int H,
+    int W,
+    int K,
+    int stride,
+    int padding,
+    int H_out,
+    int W_out,
+    int total)
+{
+    int task_id = (int)taskId;
+    int task_num = (int)taskDim;
+
+    int columns = H_out * W_out;
+    int kernel_area = K * K;
+    int rows = C * kernel_area;
+    int per_batch = rows * columns;
+
+    for (int index = task_id; index < total; index += task_num) {
+        int n = index / per_batch;
+        int inner = index - n * per_batch;
+        int row = inner / columns;
+        int col = inner - row * columns;
+
+        int c = row / kernel_area;
+        int k_rem = row - c * kernel_area;
+        int kh = k_rem / K;
+        int kw = k_rem - kh * K;
+
+        int oh = col / W_out;
+        int ow = col - oh * W_out;
+
+        int ih = oh * stride + kh - padding;
+        int iw = ow * stride + kw - padding;
+
+        if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+            int input_index = ((n * C + c) * H + ih) * W + iw;
+            output[index] = input[input_index];
+        } else {
+            output[index] = (half)0.0f;
+        }
+    }
+}
+
+
+torch::Tensor bang_func(torch::Tensor x, int kernel_size, int stride, int padding)
+{
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be float16");
+    TORCH_CHECK(x.dim() == 4, "x must be 4D: [N, C, H, W]");
+    TORCH_CHECK(kernel_size > 0, "kernel_size must be greater than 0");
+    TORCH_CHECK(stride > 0, "stride must be greater than 0");
+    TORCH_CHECK(padding >= 0, "padding must be non-negative");
+
+    int N = (int)x.size(0);
+    int C = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    int K = kernel_size;
+
+    int H_out = (H + 2 * padding - K) / stride + 1;
+    int W_out = (W + 2 * padding - K) / stride + 1;
+
+    TORCH_CHECK(H_out > 0 && W_out > 0,
+                "Invalid output size: H_out=", H_out, ", W_out=", W_out);
+
+    int rows = C * K * K;
+    int columns = H_out * W_out;
+    int total = N * rows * columns;
+
+    auto output = torch::empty({N, rows, columns}, x.options());
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    unfold_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(x.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+        N,
+        C,
+        H,
+        W,
+        K,
+        stride,
+        padding,
+        H_out,
+        W_out,
+        total);
+
+    return output;
+}
