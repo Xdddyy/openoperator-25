@@ -140,18 +140,22 @@ __mlu_entry__ void dilated_conv2d_kernel(
 
                             int iw_start = ow_start + iw_offset;
 
-                            // ---- 按 64 分块，确保安全 ----
+                            // ---- 先处理完整的 64 元素块（对齐部分）----
                             int cur_ow = ow_start;
                             int cur_iw = iw_start;
-                            while (cur_ow < ow_end) {
-                                int chunk = ow_end - cur_ow;
-                                if (chunk > 64) chunk = 64;
+                            int remaining = valid_w;
 
-                                __bang_mul_scalar(nram_row_tmp, nram_in + nram_in_row * W + cur_iw, w_val, chunk);
-                                __bang_add(nram_row_acc + cur_ow, nram_row_acc + cur_ow, nram_row_tmp, chunk);
+                            while (remaining >= 64) {
+                                __bang_mul_scalar(nram_row_tmp, nram_in + nram_in_row * W + cur_iw, w_val, 64);
+                                __bang_add(nram_row_acc + cur_ow, nram_row_acc + cur_ow, nram_row_tmp, 64);
+                                cur_ow += 64;
+                                cur_iw += 64;
+                                remaining -= 64;
+                            }
 
-                                cur_ow += chunk;
-                                cur_iw += chunk;
+                            // ---- 剩余部分用标量处理，避免越界 ----
+                            for (int i = 0; i < remaining; i++) {
+                                nram_row_acc[cur_ow + i] += w_val * nram_in[nram_in_row * W + cur_iw + i];
                             }
                         }
                     }
