@@ -1,5 +1,6 @@
-// v110_41_probe_notifier_device_time
-#include <bang.h>
+// v110_42_probe_queue_sync_only
+#warning "BUILD_VERSION v110_42_probe_queue_sync_only"
+
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
@@ -7,59 +8,20 @@
 #include "framework/core/MLUStream.h"
 
 #define BATCH 64
-#define N_COL 1024
 #define K_COL 32
-#define TOTAL_OUTPUT_ELEMS (BATCH * K_COL)
-
-__mlu_entry__ void floorA_half_kernel(
-    const half *input,
-    const int64_t *index,
-    half *output
-) {
-    if (taskId != 0) return;
-
-    __nram__ half buf[TOTAL_OUTPUT_ELEMS];
-
-    __memcpy(buf,
-             input,
-             TOTAL_OUTPUT_ELEMS * sizeof(half),
-             GDRAM2NRAM);
-
-    __memcpy(output,
-             buf,
-             TOTAL_OUTPUT_ELEMS * sizeof(half),
-             NRAM2GDRAM);
-}
 
 torch::Tensor bang_func(torch::Tensor input, torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cnrtNotifier_t start, end;
-    cnrtNotifierCreate(&start);
-    cnrtNotifierCreate(&end);
-
-    cnrtPlaceNotifier(start, queue);
-
-    floorA_half_kernel<<<dim, ktype, queue>>>(
-        (const half*)input.data_ptr<at::Half>(),
-        index.data_ptr<int64_t>(),
-        (half*)output.data_ptr<at::Half>());
-
-    cnrtPlaceNotifier(end, queue);
-    cnrtQueueSync(queue);
-
-    float us = -1.0f;
-    cnrtNotifierDuration(start, end, &us);
-
-    fprintf(stderr, "[DEVICE_TIME_PROBE] floorA_device_us=%.3f\n", us);
+    fprintf(stderr, "[SYNC_ONLY] queue=%p\n", (void*)queue);
     fflush(stderr);
 
-    cnrtNotifierDestroy(start);
-    cnrtNotifierDestroy(end);
+    cnrtRet_t ret = cnrtQueueSync(queue);
+
+    fprintf(stderr, "[SYNC_ONLY] ret=%d\n", (int)ret);
+    fflush(stderr);
 
     return output;
 }
