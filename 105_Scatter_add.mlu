@@ -27,48 +27,48 @@ __mlu_entry__ void scatter_add_kernel(
     float *local_out = partial_output + core_id * dim_size * D;
 
     __nram__ float nram_src[CHUNK_SIZE];
-    __nram__ float nram_dst[CHUNK_SIZE];
+    __nram__ float nram_acc[CHUNK_SIZE];
 
-    for (uint32_t i = 0; i < count; i++) {
-        int idx = index[start + i];
-        idx = (idx % dim_size + dim_size) % dim_size;
-        float *src_row = src + (start + i) * D;
-        float *dst_row = local_out + idx * D;
+    int num_groups = (dim_size + 15) / 16;
 
-        for (int d = 0; d < D; d += CHUNK_SIZE) {
+    for (int g = 0; g < num_groups; g++) {
 
-            int chunk =
-                (d + CHUNK_SIZE <= D)
-                    ? CHUNK_SIZE
-                    : (D - d);
+        for (int p = 0; p < CHUNK_SIZE; p++) {
+            nram_acc[p] = 0.0f;
+        }
+
+        int group_start = g * 16;
+        int group_end = group_start + 16;
+        if (group_end > dim_size) group_end = dim_size;
+
+        for (uint32_t i = 0; i < count; i++) {
+            int idx = index[start + i];
+            idx = (idx % dim_size + dim_size) % dim_size;
+
+            if (idx < group_start || idx >= group_end) continue;
+
+            int local_row = idx - group_start;
+            int acc_offset = local_row * D;
+            float *src_row = src + (start + i) * D;
 
             __memcpy(
                 nram_src,
-                src_row + d,
-                chunk * sizeof(float),
+                src_row,
+                D * sizeof(float),
                 GDRAM2NRAM);
 
-            __memcpy(
-                nram_dst,
-                dst_row + d,
-                chunk * sizeof(float),
-                GDRAM2NRAM);
-
-            for (int p = chunk; p < CHUNK_SIZE; p++) {
-                nram_src[p] = 0.0f;
-                nram_dst[p] = 0.0f;
+            for (int d = 0; d < D; d++) {
+                nram_acc[acc_offset + d] += nram_src[d];
             }
+        }
 
-            __bang_add(
-                nram_dst,
-                nram_dst,
-                nram_src,
-                CHUNK_SIZE);
-
+        for (int r = group_start; r < group_end; r++) {
+            int local_row = r - group_start;
+            float *dst_row = local_out + r * D;
             __memcpy(
-                dst_row + d,
-                nram_dst,
-                chunk * sizeof(float),
+                dst_row,
+                nram_acc + local_row * D,
+                D * sizeof(float),
                 NRAM2GDRAM);
         }
     }
