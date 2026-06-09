@@ -241,15 +241,16 @@ def test_operator(name, meta, device="mlu"):
 
     # 运行 MLU kernel（预热 + 计时）
     bang_func = module.bang_func
+    extra_vals = list(extra.values())
     with torch.no_grad():
         for _ in range(3):
-            bang_func(*inputs_mlu, **extra)
+            bang_func(*inputs_mlu, *extra_vals)
         torch.mlu.synchronize()
 
         N_ITER = 100
         t0 = time.perf_counter()
         for _ in range(N_ITER):
-            result_mlu = bang_func(*inputs_mlu, **extra)
+            result_mlu = bang_func(*inputs_mlu, *extra_vals)
         torch.mlu.synchronize()
         mlu_time_ms = (time.perf_counter() - t0) / N_ITER * 1000
 
