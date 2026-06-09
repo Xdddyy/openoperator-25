@@ -3,24 +3,26 @@
 #include <cnrt.h>
 
 /* ============================================================================
- * BatchNorm2D Kernel
+ * BatchNorm2D Kernel (NRAM 向量化版本)
  *
- * 对四维张量 [batch, channels, H, W] 执行逐通道的批归一化：
+ * 对四维张量 [batch, channels, H, W] 执行逐通道批归一化。
  *
- *   mean[c] = (1 / N*H*W) * \sum_{n,h,w} x[n, c, h, w]
- *   var[c]  = (1 / N*H*W) * \sum_{n,h,w} (x[n, c, h, w] - mean[c])^2
- *   y[n, c, h, w] = gamma[c] * (x - mean[c]) / sqrt(var[c] + eps) + beta[c]
+ * 优化策略:
+ *   - NRAM 分块: TILE_SIZE 元素为一块加载到 NRAM，消除逐元素 GDRAM 访问
+ *   - Pass 1: NRAM 上标量累加 sum/sum_sq（NRAM 带宽 ~TB/s，极快）
+ *   - Pass 2: 全向量化归一化 (sub_scalar + mul_scalar + add_scalar)
+ *   - 多核拆分: 按通道维度并行
  *
- * 多核拆分：按通道维度拆分，每个 core 独立处理若干通道的完整计算。
- * 每个通道两趟遍历：
- *   Pass 1 — 累加 sum 与 sum_sq（利用 Var = E[X²] - E[X]²）
- *   Pass 2 — 用均值/方差做归一化并写出结果
+ * 公式:
+ *   mean[c]  = sum / (N*H*W)
+ *   var[c]   = sum_sq / (N*H*W) - mean²
+ *   y = gamma * (x - mean) / sqrt(var + eps) + beta
  * ============================================================================
  */
 __mlu_entry__ void batchnorm2d_kernel(
     const float* input,       // [N, C, H, W]
-    const float* weight,      // [C]   — gamma  缩放参数
-    const float* bias,        // [C]   — beta   偏移参数
+    const float* weight,      // [C]   — gamma
+    const float* bias,        // [C]   — beta
     float* output,            // [N, C, H, W]
     int N,
     int C,
@@ -29,7 +31,7 @@ __mlu_entry__ void batchnorm2d_kernel(
     float eps)
 {
     // ========================================================================
-    // 多核拆分：按通道 (C) 维度均分
+    // 多核拆分: 按通道 (C) 维度均分
     // ========================================================================
     uint32_t core_id   = taskId;
     uint32_t core_num  = taskDim;
@@ -41,10 +43,16 @@ __mlu_entry__ void batchnorm2d_kernel(
     uint32_t count_c = per_core +
                        (core_id < remainder ? 1 : 0);
 
-    int spatial_size       = H * W;          // 单通道空间元素数
-    int channel_stride     = spatial_size;   // 相邻通道间距
-    int batch_chunk_stride = C * spatial_size; // 相邻 batch 间距
-    float N_total          = (float)(N * spatial_size); // 归一化分母
+    int spatial_size       = H * W;
+    int channel_stride     = spatial_size;
+    int batch_chunk_stride = C * spatial_size;
+    int total_per_channel  = N * spatial_size;
+    float N_total          = (float)total_per_channel;
+
+    // ---- NRAM tile 配置 ----
+    // 单个缓冲区 16384 floats (64KB)，NRAM 总计 512KB 内安全
+    #define TILE_SIZE 16384
+    __nram__ float nram_buf[TILE_SIZE];
 
     // ========================================================================
     // 遍历分配给本 core 的每个通道
@@ -52,41 +60,77 @@ __mlu_entry__ void batchnorm2d_kernel(
     for (uint32_t c_idx = 0; c_idx < count_c; c_idx++) {
         int c = (int)(start_c + c_idx);
 
-        // ---- Pass 1: 累加 sum 与 sum_sq（一次遍历完成） ----
+        // ================================================================
+        // Pass 1: 分块累加 sum 与 sum_sq
+        // ================================================================
         float sum   = 0.0f;
         float sum_sq = 0.0f;
 
         for (int n = 0; n < N; n++) {
-            const float* ch_start =
+            const float* ch_base =
                 input + n * batch_chunk_stride + c * channel_stride;
+            int offset = 0;
 
-            for (int i = 0; i < spatial_size; i++) {
-                float val = ch_start[i];
-                sum   += val;
-                sum_sq += val * val;
+            while (offset < spatial_size) {
+                int tile = spatial_size - offset;
+                if (tile > TILE_SIZE) tile = TILE_SIZE;
+
+                // 加载一块到 NRAM
+                __memcpy(nram_buf, ch_base + offset,
+                         tile * sizeof(float), GDRAM2NRAM);
+
+                // NRAM 上标量累加（NRAM 带宽极高，标量循环不会成为瓶颈）
+                for (int i = 0; i < tile; i++) {
+                    float val = nram_buf[i];
+                    sum   += val;
+                    sum_sq += val * val;
+                }
+
+                offset += tile;
             }
         }
 
-        // 均值与方差: E[X] 与 E[X²] - E[X]²
+        // 均值与方差
         float mean = sum / N_total;
         float var  = sum_sq / N_total - mean * mean;
-        // 防止数值问题导致负方差
         if (var < 0.0f) var = 0.0f;
 
         float inv_std = 1.0f / sqrtf(var + eps);
         float gamma   = weight[c];
         float beta    = bias[c];
 
-        // ---- Pass 2: 归一化并写出 ----
+        // ================================================================
+        // Pass 2: 分块向量化归一化
+        // ================================================================
         for (int n = 0; n < N; n++) {
             const float* in_ch =
                 input + n * batch_chunk_stride + c * channel_stride;
             float* out_ch =
                 output + n * batch_chunk_stride + c * channel_stride;
+            int offset = 0;
 
-            for (int i = 0; i < spatial_size; i++) {
-                float x_hat = (in_ch[i] - mean) * inv_std;
-                out_ch[i]   = gamma * x_hat + beta;
+            while (offset < spatial_size) {
+                int tile = spatial_size - offset;
+                if (tile > TILE_SIZE) tile = TILE_SIZE;
+
+                // 加载一块到 NRAM
+                __memcpy(nram_buf, in_ch + offset,
+                         tile * sizeof(float), GDRAM2NRAM);
+
+                // ---- 全向量化归一化 ----
+                // x_hat = (x - mean) * inv_std
+                __bang_sub_scalar(nram_buf, nram_buf, mean, tile);
+                __bang_mul_scalar(nram_buf, nram_buf, inv_std, tile);
+
+                // y = gamma * x_hat + beta
+                __bang_mul_scalar(nram_buf, nram_buf, gamma, tile);
+                __bang_add_scalar(nram_buf, nram_buf, beta, tile);
+
+                // 写回 GDRAM
+                __memcpy(out_ch + offset, nram_buf,
+                         tile * sizeof(float), NRAM2GDRAM);
+
+                offset += tile;
             }
         }
     }
@@ -156,8 +200,9 @@ torch::Tensor bang_func(
     // -------- 获取 MLU Stream 并启动 Kernel --------
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+    // 使用 cnrtFuncTypeBlock + 16 个任务，充分利用 MLU370 的 16 核
+    cnrtDim3_t dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     batchnorm2d_kernel<<<dim, ktype, queue>>>(
         x_fp32.data_ptr<float>(),

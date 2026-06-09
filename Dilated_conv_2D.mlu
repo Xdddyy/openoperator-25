@@ -70,7 +70,7 @@ __mlu_entry__ void dilated_conv2d_kernel(
     // NRAM 变量声明于函数顶层，各 tile 复用
     __nram__ float nram_in[16384];    // 输入通道 tile
     __nram__ float nram_out[16384];   // 输出 tile 累加器
-    __nram__ float nram_tmp[256];     // 向量临时缓冲
+    __nram__ float nram_tmp[4096];    // 行累加器 + 中间缓冲 (各半)
 
     // ========================================================================
     // 每个 core 处理分配给它的 (n, oc) 对
@@ -125,57 +125,63 @@ __mlu_entry__ void dilated_conv2d_kernel(
                     weight + oc * w_oc_stride + ic * w_ic_stride;
 
                 // ------------------------------------------------------------
-                // 遍历卷积核位置 (kh, kw)
+                // 逐输出行合并所有 (kh, kw) 贡献后再一次性累加到 nram_out
+                // 将 nram_out 更新次数从 C_in*K*K 降至 C_in，大幅降低舍入误差
                 // ------------------------------------------------------------
-                for (int kh = 0; kh < kH; kh++) {
-                    int ih_offset = kh * dilation_h - padding_h;
+                // nram_tmp 分为两半: [0..127] 行累加器, [128..255] 中间结果
+                float* nram_row_acc = nram_tmp;           // 128 floats
+                float* nram_row_tmp = nram_tmp + 128;     // 128 floats
 
-                    // 有效输出行范围: oh 使得 oh + ih_offset ∈ [0, H)
-                    int oh_k_start = 0 - ih_offset;   // oh >= -ih_offset
-                    if (oh_k_start < 0) oh_k_start = 0;
-                    int oh_k_end = H - ih_offset;      // oh < H - ih_offset
-                    if (oh_k_end > H_out) oh_k_end = H_out;
-                    // 与当前 tile 求交集
-                    if (oh_k_start < oh_tile_start) oh_k_start = oh_tile_start;
-                    if (oh_k_end > oh_tile_end) oh_k_end = oh_tile_end;
+                // 当前 tile 的所有输出行
+                for (int oh = oh_tile_start; oh < oh_tile_end; oh++) {
+                    int nram_out_row = oh - oh_tile_start;
 
-                    if (oh_k_start >= oh_k_end) continue;  // 无有效行
+                    // ---- Step 1: 清零行累加器 ----
+                    __bang_write_zero(nram_row_acc, W_out);
 
-                    for (int kw = 0; kw < kW; kw++) {
-                        float w_val = w_base[kh * kW + kw];
-                        if (w_val == 0.0f) continue;
+                    // ---- Step 2: 遍历 (kh, kw)，累加到行缓冲 ----
+                    for (int kh = 0; kh < kH; kh++) {
+                        int ih_offset = kh * dilation_h - padding_h;
+                        int ih = oh + ih_offset;
+                        if (ih < 0 || ih >= H) continue;  // 该 kh 无有效输入行
 
-                        int iw_offset = kw * dilation_w - padding_w;
+                        int nram_in_row = ih - load_ih_start;
 
-                        // 有效输出列范围: ow 使得 ow + iw_offset ∈ [0, W)
-                        int ow_start = 0 - iw_offset;
-                        if (ow_start < 0) ow_start = 0;
-                        int ow_end = W - iw_offset;
-                        if (ow_end > W_out) ow_end = W_out;
-                        int valid_w = ow_end - ow_start;
-                        if (valid_w <= 0) continue;
+                        for (int kw = 0; kw < kW; kw++) {
+                            float w_val = w_base[kh * kW + kw];
+                            if (w_val == 0.0f) continue;
 
-                        int iw_start = ow_start + iw_offset;
+                            int iw_offset = kw * dilation_w - padding_w;
 
-                        // ---- 向量化: 逐行做乘加 ----
-                        for (int oh = oh_k_start; oh < oh_k_end; oh++) {
-                            int ih = oh + ih_offset;
-                            int nram_in_row = ih - load_ih_start;
-                            int nram_out_row = oh - oh_tile_start;
+                            int ow_start = 0 - iw_offset;
+                            if (ow_start < 0) ow_start = 0;
+                            int ow_end = W - iw_offset;
+                            if (ow_end > W_out) ow_end = W_out;
+                            int valid_w = ow_end - ow_start;
+                            if (valid_w <= 0) continue;
 
-                            // nram_out[oh] += w_val * nram_in[ih][iw_start:]
+                            int iw_start = ow_start + iw_offset;
+
+                            // row_acc[ow_start:] += w_val * nram_in[ih][iw_start:]
                             __bang_mul_scalar(
-                                nram_tmp,
+                                nram_row_tmp,
                                 nram_in + nram_in_row * W + iw_start,
                                 w_val,
                                 valid_w);
                             __bang_add(
-                                nram_out + nram_out_row * W_out + ow_start,
-                                nram_out + nram_out_row * W_out + ow_start,
-                                nram_tmp,
+                                nram_row_acc + ow_start,
+                                nram_row_acc + ow_start,
+                                nram_row_tmp,
                                 valid_w);
                         }
                     }
+
+                    // ---- Step 3: 将该行的合并结果一次累加到 nram_out ----
+                    __bang_add(
+                        nram_out + nram_out_row * W_out,
+                        nram_out + nram_out_row * W_out,
+                        nram_row_acc,
+                        W_out);
                 }
             }
 
