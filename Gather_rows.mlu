@@ -120,3 +120,6 @@ torch::Tensor bang_func(torch::Tensor input,
     return output;
 }
 
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "Gather_rows");
+}
