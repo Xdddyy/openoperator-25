@@ -169,14 +169,26 @@ def compile_and_load(mlu_path):
     # ---------- Step 2: 生成包装器 + torch cpp_extension 链接 ----------
     params = _extract_bang_func_params(mlu_path)
     param_str = ", ".join(params) if params else ""
+
+    py_args = []
+    for p in params:
+        parts = p.rsplit(None, 1)
+        ptype, pname = parts if len(parts) == 2 else (p, "")
+        if ptype == "c10::optional<torch::Tensor>":
+            py_args.append(f'py::arg("{pname}") = py::none()')
+        else:
+            py_args.append(f'py::arg("{pname}")')
+    py_args_str = ", ".join(py_args)
+
     wrapper_code = f"""\
 #include <torch/extension.h>
+namespace py = pybind11;
 
 // bang_func 在 .o 中定义，此处仅做声明供 pybind11 绑定
 torch::Tensor bang_func({param_str});
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
-    m.def("bang_func", &bang_func, "BANG C kernel entry");
+    m.def("bang_func", &bang_func, {py_args_str});
 }}
 """
     wrapper_path = mlu_path.parent / f"{stem}_wrapper.cpp"
