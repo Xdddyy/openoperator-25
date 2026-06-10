@@ -4,99 +4,27 @@
 
 #define ROWS 128
 #define COLS 4000
-#define NRAM_COLS 4096
 #define TASK_NUM 128
 
-__mlu_entry__ void cumsum_half_dim1_scan_kernel(
+__mlu_entry__ void cumsum_half_to_float_dim1_kernel(
     half* input,
-    half* output,
+    float* output,
     int rows,
     int cols
 ) {
     uint32_t tid = taskId;
     uint32_t task_num = taskDim;
 
-    __nram__ half buf[NRAM_COLS];
-    __nram__ half tmp[NRAM_COLS];
-
+   
     for (int row = tid; row < rows; row += task_num) {
         int base = row * cols;
 
-        // Load one row.
-        __memcpy(
-            buf,
-            input + base,
-            cols * sizeof(half),
-            GDRAM2NRAM
-        );
+        float acc = 0.0f;
 
-        // Important:
-        // Clear the tail [cols, NRAM_COLS), because vector ops use aligned length.
-        // Without this, aligned vector ops may read/write uninitialized tail data.
-        int tail = NRAM_COLS - cols;
-        if (tail > 0) {
-            __bang_write_zero(
-                buf + cols,
-                tail
-            );
-            __bang_write_zero(
-                tmp + cols,
-                tail
-            );
+        for (int col = 0; col < cols; ++col) {
+            acc += (float)input[base + col];
+            output[base + col] = acc;
         }
-
-       
-        for (int offset = 1; offset < cols; offset <<= 1) {
-            int valid_len = cols - offset;
-            int aligned_len = (valid_len + 63) & ~63;
-
-            // tmp[offset : offset + valid_len] = old buf[0 : valid_len]
-            __memcpy(
-                tmp + offset,
-                buf,
-                valid_len * sizeof(half),
-                NRAM2NRAM
-            );
-
-          
-            __bang_write_zero(
-                tmp,
-                offset
-            );
-
-           
-            int end_pos = offset + aligned_len;
-            if (end_pos > cols) {
-                int clear_start = cols;
-                int clear_len = end_pos - cols;
-                if (clear_len > 0) {
-                    __bang_write_zero(
-                        buf + clear_start,
-                        clear_len
-                    );
-                    __bang_write_zero(
-                        tmp + clear_start,
-                        clear_len
-                    );
-                }
-            }
-
-            // buf[offset : offset + valid_len] += old buf[0 : valid_len]
-            __bang_add(
-                buf + offset,
-                buf + offset,
-                tmp + offset,
-                aligned_len
-            );
-        }
-
-        // Store one row.
-        __memcpy(
-            output + base,
-            buf,
-            cols * sizeof(half),
-            NRAM2GDRAM
-        );
     }
 }
 
@@ -112,16 +40,20 @@ torch::Tensor bang_func(
                 "This implementation expects float16 input.");
 
     torch::Tensor x = input.contiguous();
-    torch::Tensor output = torch::empty_like(x);
+
+    auto output = torch::empty(
+        {ROWS, COLS},
+        x.options().dtype(torch::kFloat32)
+    );
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     cnrtDim3_t k_dim = {TASK_NUM, 1, 1};
     cnrtFunctionType_t k_type = cnrtFuncTypeUnion1;
 
-    cumsum_half_dim1_scan_kernel<<<k_dim, k_type, queue>>>(
+    cumsum_half_to_float_dim1_kernel<<<k_dim, k_type, queue>>>(
         reinterpret_cast<half*>(x.data_ptr<at::Half>()),
-        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+        output.data_ptr<float>(),
         ROWS,
         COLS
     );
