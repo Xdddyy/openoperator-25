@@ -25,41 +25,48 @@ __mlu_entry__ void gemv_kernel(
 
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t row = start_row + i;
-        double acc = 0.0;   // 关键修改：使用 double 累加器
+        float acc = 0.0f;
+        float comp = 0.0f;          // Kahan 补偿项
 
         for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
             uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
             uint32_t aligned_len = (len + 63) & ~63;
 
-            // 加载 B 片段
+            // 加载 B
             __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
             for (uint32_t j = len; j < aligned_len; ++j) {
                 nram_b[j] = 0.0f;
             }
 
-            // 加载 A 当前行片段
+            // 加载 A 当前行
             __memcpy(nram_a, A + row * K + offset, len * sizeof(float), GDRAM2NRAM);
             for (uint32_t j = len; j < aligned_len; ++j) {
                 nram_a[j] = 0.0f;
             }
 
-            // 向量乘法
+            // 向量乘
             __bang_mul(nram_a, nram_a, nram_b, aligned_len);
 
-            // 手工累加（使用 double 临时变量）
-            double partial_sum = 0.0;
+            // Kahan 补偿求和（仅使用 float）
+            float partial_sum = 0.0f;
+            float partial_comp = 0.0f;
             for (uint32_t j = 0; j < len; ++j) {
-                partial_sum += (double)nram_a[j];
+                float y = nram_a[j] - partial_comp;
+                float t = partial_sum + y;
+                partial_comp = (t - partial_sum) - y;
+                partial_sum = t;
             }
-            acc += partial_sum;
+            // 将当前块的部分和合并到全局累加器（再次 Kahan）
+            float y = partial_sum - comp;
+            float t = acc + y;
+            comp = (t - acc) - y;
+            acc = t;
         }
 
-        // 写回结果（double -> float）
-        C[row] = (float)acc;
+        C[row] = acc;   // 写入最终结果
     }
 }
 
-// Python 入口函数名必须为 bang_func
 torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
@@ -74,7 +81,6 @@ torch::Tensor bang_func(
     int M = A.size(0);
     int K = A.size(1);
 
-    // 类型转换到 float
     auto original_dtype = A.scalar_type();
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
