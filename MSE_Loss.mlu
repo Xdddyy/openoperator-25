@@ -2,120 +2,6 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#include "framework/core/MLUStream.h"
-
-#include <cstdint>
-#include <climits>
-
-#define CHUNK_SIZE 4096
-#define CORE_NUM 4
-
-#define CNRT_CHECK_RET(expr)                                      \
-    do {                                                          \
-        cnrtRet_t ret = (expr);                                   \
-        TORCH_CHECK(ret == CNRT_RET_SUCCESS,                      \
-                    "CNRT error, ret = ", static_cast<int>(ret)); \
-    } while (0)
-
-
-__mlu_entry__ void mse_partial_kernel(
-    float *predictions,
-    float *targets,
-    float *partial_output,
-    int total,
-    int core_num_arg) {
-
-    int core_id = taskId;
-    int core_num = core_num_arg;
-
-    if (core_id >= core_num) {
-        return;
-    }
-
-    int per_core = total / core_num;
-    int remainder = total % core_num;
-
-    int start = core_id * per_core +
-                (core_id < remainder ? core_id : remainder);
-
-    int count = per_core +
-                (core_id < remainder ? 1 : 0);
-
-    __nram__ float nram_pred[CHUNK_SIZE];
-    __nram__ float nram_targ[CHUNK_SIZE];
-    __nram__ float nram_out[1];
-
-    float local_sum = 0.0f;
-
-    for (int offset = 0; offset < count; offset += CHUNK_SIZE) {
-        int len =
-            (offset + CHUNK_SIZE <= count)
-                ? CHUNK_SIZE
-                : (count - offset);
-
-        __memcpy(
-            nram_pred,
-            predictions + start + offset,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        __memcpy(
-            nram_targ,
-            targets + start + offset,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        for (int i = 0; i < len; i++) {
-            float diff = nram_pred[i] - nram_targ[i];
-            local_sum += diff * diff;
-        }
-    }
-
-    nram_out[0] = local_sum;
-
-    __memcpy(
-        partial_output + core_id,
-        nram_out,
-        sizeof(float),
-        NRAM2GDRAM);
-}
-
-
-__mlu_entry__ void mse_reduce_kernel(
-    float *partial_output,
-    float *output,
-    int total,
-    int core_num_arg) {
-
-    if (taskId != 0) {
-        return;
-    }
-
-    __nram__ float nram_partial[CORE_NUM];
-    __nram__ float nram_out[1];
-
-    __memcpy(
-        nram_partial,
-        partial_output,
-        core_num_arg * sizeof(float),
-        GDRAM2NRAM);
-
-    float global_sum = 0.0f;
-
-    for (int i = 0; i < core_num_arg; i++) {
-        global_sum += nram_partial[i];
-    }
-
-    nram_out[0] = global_sum / (float)total;
-
-    __memcpy(
-        output,
-        nram_out,
-        sizeof(float),
-        NRAM2GDRAM);
-}
-
-
 torch::Tensor bang_func(
     torch::Tensor predictions,
     torch::Tensor targets) {
@@ -125,24 +11,12 @@ torch::Tensor bang_func(
         "predictions and targets must have the same shape");
 
     TORCH_CHECK(
-        predictions.is_contiguous(),
-        "predictions must be contiguous");
-
-    TORCH_CHECK(
-        targets.is_contiguous(),
-        "targets must be contiguous");
-
-    TORCH_CHECK(
         predictions.device() == targets.device(),
         "predictions and targets must be on the same device");
 
     TORCH_CHECK(
         predictions.numel() > 0,
         "MSE input must not be empty");
-
-    TORCH_CHECK(
-        predictions.numel() <= INT_MAX,
-        "input tensor is too large");
 
     auto original_dtype = predictions.scalar_type();
 
@@ -157,48 +31,12 @@ torch::Tensor bang_func(
         targ_fp32 = targets.to(torch::kFloat);
     }
 
-    pred_fp32 = pred_fp32.contiguous();
-    targ_fp32 = targ_fp32.contiguous();
-
-    int total = static_cast<int>(pred_fp32.numel());
-
-    auto float_options = torch::TensorOptions()
-                             .dtype(torch::kFloat)
-                             .device(pred_fp32.device());
-
-    auto partial_output = torch::empty(
-        {CORE_NUM},
-        float_options);
-
-    auto output_fp32 = torch::empty(
-        {1},
-        float_options);
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    cnrtDim3_t dim_partial = {CORE_NUM, 1, 1};
-    cnrtDim3_t dim_reduce = {1, 1, 1};
-
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    mse_partial_kernel<<<dim_partial, ktype, queue>>>(
-        pred_fp32.data_ptr<float>(),
-        targ_fp32.data_ptr<float>(),
-        partial_output.data_ptr<float>(),
-        total,
-        CORE_NUM);
-
-    mse_reduce_kernel<<<dim_reduce, ktype, queue>>>(
-        partial_output.data_ptr<float>(),
-        output_fp32.data_ptr<float>(),
-        total,
-        CORE_NUM);
-
-    CNRT_CHECK_RET(cnrtQueueSync(queue));
+    auto diff = pred_fp32 - targ_fp32;
+    auto output = (diff * diff).mean();
 
     if (original_dtype != torch::kFloat) {
-        output_fp32 = output_fp32.to(original_dtype);
+        output = output.to(original_dtype);
     }
 
-    return output_fp32.reshape({});
+    return output;
 }
