@@ -26,12 +26,12 @@ __mlu_entry__ void scatter_add_kernel(
 
     float *local_out = partial_output + core_id * dim_size * D;
 
-    __nram__ float nram_src[CHUNK_SIZE];
-    __nram__ float nram_acc[CHUNK_SIZE];
-
     int num_groups = (dim_size + 15) / 16;
 
     for (int g = 0; g < num_groups; g++) {
+
+        __nram__ float nram_src[CHUNK_SIZE];
+        __nram__ float nram_acc[CHUNK_SIZE];
 
         for (int p = 0; p < CHUNK_SIZE; p++) {
             nram_acc[p] = 0.0f;
@@ -58,7 +58,9 @@ __mlu_entry__ void scatter_add_kernel(
                 GDRAM2NRAM);
 
             for (int d = 0; d < D; d++) {
-                nram_acc[acc_offset + d] += nram_src[d];
+                float src_val = nram_src[d];
+                float acc_val = nram_acc[acc_offset + d];
+                nram_acc[acc_offset + d] = acc_val + src_val;
             }
         }
 
