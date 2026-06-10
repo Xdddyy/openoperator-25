@@ -3,61 +3,128 @@
 #include <framework/core/MLUStream.h>
 #include <cnrt.h>
 
-__mlu_entry__ void zero_half_kernel(
-    half *output,
-    int total)
-{
-    uint32_t task_id = taskId;
-    uint32_t task_num = taskDim;
-    uint32_t per_task = total / task_num;
-    uint32_t rem = total % task_num;
-    uint32_t start = task_id * per_task + (task_id < rem ? task_id : rem);
-    uint32_t count = per_task + (task_id < rem ? 1 : 0);
+// ============================================================================
+// 138 GRU forward （correctness-first 基线版）
+//
+// 实现 torch.nn.GRU(num_layers=2, batch_first=True, bidirectional=False) 前向，
+// 返回所有时间步、最后一层的隐藏状态 output，形状 [B, S, H]。
+//
+// PyTorch GRU 公式（门顺序为 r,z,n）：
+//   r_t = sigmoid(W_ir x + b_ir + W_hr h + b_hr)
+//   z_t = sigmoid(W_iz x + b_iz + W_hz h + b_hz)
+//   n_t = tanh   (W_in x + b_in + r ⊙ (W_hn h + b_hn))
+//   h_t = (1 - z) ⊙ n + z ⊙ h_{t-1}
+//
+// 本版本：单核顺序递推，保证正确性优先（先过 1e-2 精度，再谈性能）。
+// 权重按行从 GDRAM 取、转 fp32 累加；激活用 NRAM 向量指令。
+//
+// 假设（与评测参考一致时才成立，若不符请按实际改）：
+//   - num_layers == 2，batch_first，单向，bias=True，输入 dtype float16
+//   - hidden_size <= 1024, input_size <= 2048
+// ============================================================================
 
-    for (uint32_t i = 0; i < count; ++i) {
-        output[start + i] = (half)0.0f;
+#define MAX_H    1024
+#define MAX_FEAT 2048
+#define ALIGN64(x) (((x) + 63) & ~63)
+
+__mlu_entry__ void gru_forward_kernel(
+    half *x,        // [B, S, IN0]
+    half *wih0, half *whh0, half *bih0, half *bhh0,
+    half *wih1, half *whh1, half *bih1, half *bhh1,
+    half *out,      // [B, S, H]  既做 layer0 输出缓冲，也是最终 layer1 输出
+    int B, int S, int IN0, int H)
+{
+    if (taskId != 0) return;   // 单核完成全部递推
+
+    const int H3 = 3 * H;
+    const int Ha  = ALIGN64(H);
+    const int H3a = ALIGN64(H3);
+
+    __nram__ float xf[MAX_FEAT];
+    __nram__ float hf[MAX_FEAT];
+    __nram__ half  wrow_h[MAX_FEAT];
+    __nram__ float wrow_f[MAX_FEAT];
+    __nram__ float gi[3 * MAX_H];
+    __nram__ float gh[3 * MAX_H];
+    __nram__ float pr[MAX_H], pz[MAX_H], pn[MAX_H];
+    __nram__ float rr[MAX_H], zz[MAX_H], nn[MAX_H];
+    __nram__ half  bih_h[3 * MAX_H]; __nram__ float bih_f[3 * MAX_H];
+    __nram__ half  bhh_h[3 * MAX_H]; __nram__ float bhh_f[3 * MAX_H];
+    __nram__ half  outrow_h[MAX_H];
+
+    // 清激活缓冲尾部对齐区，避免未初始化值进激活
+    for (int i = H; i < Ha; ++i) { pr[i] = 0.f; pz[i] = 0.f; pn[i] = 0.f; }
+
+    for (int layer = 0; layer < 2; ++layer) {
+        half *wih = (layer == 0) ? wih0 : wih1;
+        half *whh = (layer == 0) ? whh0 : whh1;
+        half *bih = (layer == 0) ? bih0 : bih1;
+        half *bhh = (layer == 0) ? bhh0 : bhh1;
+        int   ID  = (layer == 0) ? IN0 : H;     // 本层输入维度
+        int   IDa = ALIGN64(ID);
+
+        // 偏置一次性载入并转 fp32
+        __memcpy(bih_h, bih, H3 * sizeof(half), GDRAM2NRAM);
+        __bang_half2float(bih_f, bih_h, H3a);
+        __memcpy(bhh_h, bhh, H3 * sizeof(half), GDRAM2NRAM);
+        __bang_half2float(bhh_f, bhh_h, H3a);
+
+        for (int b = 0; b < B; ++b) {
+            for (int i = 0; i < H; ++i) hf[i] = 0.0f;   // h0 = 0
+
+            for (int t = 0; t < S; ++t) {
+                // 本层在 (b,t) 的输入向量：layer0 读外部 x，layer1 读 out(layer0 结果)
+                half *xin = (layer == 0)
+                              ? (x   + ((long)(b * S) + t) * ID)
+                              : (out + ((long)(b * S) + t) * H);
+                __memcpy(wrow_h, xin, ID * sizeof(half), GDRAM2NRAM);
+                __bang_half2float(xf, wrow_h, IDa);
+
+                // gi = Wih · x + bih    （Wih: [3H, ID]）
+                for (int j = 0; j < H3; ++j) {
+                    __memcpy(wrow_h, wih + (long)j * ID,
+                             ID * sizeof(half), GDRAM2NRAM);
+                    __bang_half2float(wrow_f, wrow_h, IDa);
+                    float acc = bih_f[j];
+                    for (int k = 0; k < ID; ++k) acc += wrow_f[k] * xf[k];
+                    gi[j] = acc;
+                }
+                // gh = Whh · h_prev + bhh   （Whh: [3H, H]）
+                for (int j = 0; j < H3; ++j) {
+                    __memcpy(wrow_h, whh + (long)j * H,
+                             H * sizeof(half), GDRAM2NRAM);
+                    __bang_half2float(wrow_f, wrow_h, Ha);
+                    float acc = bhh_f[j];
+                    for (int k = 0; k < H; ++k) acc += wrow_f[k] * hf[k];
+                    gh[j] = acc;
+                }
+
+                // 门控
+                for (int i = 0; i < H; ++i) {
+                    pr[i] = gi[i]       + gh[i];
+                    pz[i] = gi[H + i]   + gh[H + i];
+                }
+                __bang_active_sigmoid(rr, pr, Ha);
+                __bang_active_sigmoid(zz, pz, Ha);
+
+                for (int i = 0; i < H; ++i)
+                    pn[i] = gi[2 * H + i] + rr[i] * gh[2 * H + i];
+                __bang_active_tanh(nn, pn, Ha);
+
+                for (int i = 0; i < H; ++i)
+                    hf[i] = (1.0f - zz[i]) * nn[i] + zz[i] * hf[i];
+
+                // 写回本层 h_t（覆盖 out[b,t]，layer1 时即最终结果）
+                __bang_float2half(outrow_h, hf, Ha);
+                __memcpy(out + ((long)(b * S) + t) * H,
+                         outrow_h, H * sizeof(half), NRAM2GDRAM);
+            }
+        }
     }
 }
 
-static torch::Tensor gru_forward_zero_output(
-    torch::Tensor x,
-    int input_size,
-    int hidden_size,
-    int num_layers)
-{
-    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
-    TORCH_CHECK(x.dim() == 3, "Input tensor must have shape [batch, seq_len, input_size]");
-    TORCH_CHECK(x.size(2) == input_size, "input_size does not match x.size(2)");
-    TORCH_CHECK(hidden_size > 0, "hidden_size must be positive");
-    TORCH_CHECK(num_layers > 0, "num_layers must be positive");
-    TORCH_CHECK(x.scalar_type() == torch::kHalf, "138_GRU_forward expects float16 input");
 
-    auto output = torch::empty({x.size(0), x.size(1), hidden_size}, x.options());
-    int total = output.numel();
-    if (total == 0) {
-        return output;
-    }
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    zero_half_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<half *>(output.data_ptr<at::Half>()),
-        total);
-
-    return output;
-}
-
-torch::Tensor bang_func(
-    torch::Tensor x,
-    int input_size,
-    int hidden_size,
-    int num_layers)
-{
-    return gru_forward_zero_output(x, input_size, hidden_size, num_layers);
-}
-
+// 唯一的对外入口：只保留与评测一致的「全权重」签名
 torch::Tensor bang_func(
     torch::Tensor x,
     torch::Tensor weight_ih_l0,
@@ -72,14 +139,42 @@ torch::Tensor bang_func(
     int hidden_size,
     int num_layers)
 {
-    TORCH_CHECK(weight_ih_l0.is_contiguous(), "weight_ih_l0 must be contiguous");
-    TORCH_CHECK(weight_hh_l0.is_contiguous(), "weight_hh_l0 must be contiguous");
-    TORCH_CHECK(bias_ih_l0.is_contiguous(), "bias_ih_l0 must be contiguous");
-    TORCH_CHECK(bias_hh_l0.is_contiguous(), "bias_hh_l0 must be contiguous");
-    TORCH_CHECK(weight_ih_l1.is_contiguous(), "weight_ih_l1 must be contiguous");
-    TORCH_CHECK(weight_hh_l1.is_contiguous(), "weight_hh_l1 must be contiguous");
-    TORCH_CHECK(bias_ih_l1.is_contiguous(), "bias_ih_l1 must be contiguous");
-    TORCH_CHECK(bias_hh_l1.is_contiguous(), "bias_hh_l1 must be contiguous");
+    TORCH_CHECK(x.dim() == 3, "x must be [batch, seq_len, input_size]");
+    TORCH_CHECK(x.size(2) == input_size, "input_size mismatch");
+    TORCH_CHECK(num_layers == 2, "this baseline only supports num_layers == 2");
+    TORCH_CHECK(hidden_size <= MAX_H && input_size <= MAX_FEAT,
+                "hidden_size/input_size exceed NRAM buffer limits");
 
-    return gru_forward_zero_output(x, input_size, hidden_size, num_layers);
+    auto x_c    = x.contiguous().to(torch::kHalf);
+    auto wih0_c = weight_ih_l0.contiguous().to(torch::kHalf);
+    auto whh0_c = weight_hh_l0.contiguous().to(torch::kHalf);
+    auto bih0_c = bias_ih_l0.contiguous().to(torch::kHalf);
+    auto bhh0_c = bias_hh_l0.contiguous().to(torch::kHalf);
+    auto wih1_c = weight_ih_l1.contiguous().to(torch::kHalf);
+    auto whh1_c = weight_hh_l1.contiguous().to(torch::kHalf);
+    auto bih1_c = bias_ih_l1.contiguous().to(torch::kHalf);
+    auto bhh1_c = bias_hh_l1.contiguous().to(torch::kHalf);
+
+    int Bsz = x_c.size(0), S = x_c.size(1);
+    auto output = torch::empty({Bsz, S, hidden_size}, x_c.options());
+    if (output.numel() == 0) return output;
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    gru_forward_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<half *>(x_c.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(wih0_c.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(whh0_c.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(bih0_c.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(bhh0_c.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(wih1_c.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(whh1_c.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(bih1_c.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(bhh1_c.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(output.data_ptr<at::Half>()),
+        Bsz, S, input_size, hidden_size);
+
+    return output;
 }
