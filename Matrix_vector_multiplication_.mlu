@@ -59,8 +59,8 @@ __mlu_entry__ void gemv_kernel(
     }
 }
 
-
-torch::Tensor gemv_mlu(
+// 修改入口函数名为 bang_func（与 load_inline 期望的一致）
+torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
 
