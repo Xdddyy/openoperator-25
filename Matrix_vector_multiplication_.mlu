@@ -2,7 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 8192
+#define CHUNK_SIZE 8192  // 每个分块的大小（float个数）
 
 __mlu_entry__ void gemv_kernel(
     float *A,
@@ -15,67 +15,69 @@ __mlu_entry__ void gemv_kernel(
     uint32_t task_num = taskDim;
     uint32_t per_task = M / task_num;
     uint32_t remainder = M % task_num;
-    uint32_t start_row = task_id * per_task +
-                         (task_id < remainder ? task_id : remainder);
-    uint32_t count = per_task +
-                     (task_id < remainder ? 1 : 0);
+    uint32_t start_row = task_id * per_task + (task_id < remainder ? task_id : remainder);
+    uint32_t count = per_task + (task_id < remainder ? 1 : 0);
 
-    __nram__ float nram_a[CHUNK_SIZE];
-    __nram__ float nram_b[CHUNK_SIZE];
-
+    // 每个任务的行累加器（NRAM上），count 通常不大（如≤313）
+    __nram__ float accs[1024];          // 最多支持1024行，可根据实际情况调整
     for (uint32_t i = 0; i < count; ++i) {
-        uint32_t row = start_row + i;
-        float acc = 0.0f;
+        accs[i] = 0.0f;
+    }
 
-        for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
-            uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
-            uint32_t aligned_len = (len + 63) & ~63;
+    __nram__ float nram_a[CHUNK_SIZE];   // 存放A的一行片段
+    __nram__ float nram_b[CHUNK_SIZE];   // 存放B的一个片段
 
-            // 1. 加载 B 的片段，并清零尾部以保证向量运算的正确性
-            __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
-            for (uint32_t j = len; j < aligned_len; ++j) {
-                nram_b[j] = 0.0f;
-            }
+    // 按块处理K维度，每个块加载一次B片段，然后对所有行乘加
+    for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
+        uint32_t aligned_len = (len + 63) & ~63;   // 向上对齐到64的倍数，满足规约指令要求
 
-            // 2. 加载 A 当前行的片段，并清零尾部
+        // 1. 加载B的当前片段（所有行共享）
+        __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
+        // 清零尾部，避免影响规约结果
+        for (uint32_t j = len; j < aligned_len; ++j) {
+            nram_b[j] = 0.0f;
+        }
+
+        // 2. 对该任务负责的每一行，处理当前B片段
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t row = start_row + i;
+            // 加载A的当前行片段
             __memcpy(nram_a, A + row * K + offset, len * sizeof(float), GDRAM2NRAM);
             for (uint32_t j = len; j < aligned_len; ++j) {
                 nram_a[j] = 0.0f;
             }
 
-            // 3. 向量按位乘法
+            // 向量乘：nram_a = nram_a * nram_b (逐元素乘)
             __bang_mul(nram_a, nram_a, nram_b, aligned_len);
 
-            // 4. 将乘积结果累加
-            float partial_sum = 0.0f;
-            for (uint32_t j = 0; j < aligned_len; ++j) {
-                partial_sum += nram_a[j];
-            }
-            acc += partial_sum;
+            // 硬件规约求和，结果放在nram_a[0]
+            __bang_reduce_sum(nram_a, nram_a, aligned_len);
+            accs[i] += nram_a[0];
         }
+    }
 
-        // 写入最终结果
-        C[row] = acc;
+    // 写入最终结果
+    for (uint32_t i = 0; i < count; ++i) {
+        C[start_row + i] = accs[i];
     }
 }
 
-// 修改入口函数名为 bang_func（与 load_inline 期望的一致）
+// Python 入口函数（必须与 load_inline 期望的函数名一致）
 torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
 
-    // 形状与连续性检查
-    TORCH_CHECK(A.is_contiguous(), "Input tensor A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "Input tensor B must be contiguous");
-    TORCH_CHECK(A.dim() == 2, "A must be a 2D tensor [M, K]");
-    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be a 2D tensor [K, 1]");
-    TORCH_CHECK(A.size(1) == B.size(0),
-                "Inner dimensions must match: A.shape[1] == B.shape[0]");
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    TORCH_CHECK(A.dim() == 2, "A must be 2D [M, K]");
+    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be [K, 1]");
+    TORCH_CHECK(A.size(1) == B.size(0), "Inner dimension mismatch");
 
     int M = A.size(0);
     int K = A.size(1);
 
-    // 类型转换，确保计算使用 float
+    // 统一转为 float 计算
     auto original_dtype = A.scalar_type();
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
@@ -87,7 +89,7 @@ torch::Tensor bang_func(
     auto C_fp32 = torch::empty({M, 1}, A_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {32, 1, 1};
+    cnrtDim3_t dim = {32, 1, 1};          // 启动32个任务（根据实际MLU核心数可调整）
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     gemv_kernel<<<dim, ktype, queue>>>(
@@ -98,6 +100,7 @@ torch::Tensor bang_func(
         K
     );
 
+    // 若原始类型非float，转回原类型
     if (original_dtype != torch::kFloat) {
         return C_fp32.to(original_dtype);
     }
