@@ -1,7 +1,9 @@
 #include <bang.h>
 #include <torch/extension.h>
+#include <ATen/ops/gru.h>
 #include <framework/core/MLUStream.h>
 #include <cnrt.h>
+#include <vector>
 
 __mlu_entry__ void zero_half_kernel(
     half *output,
@@ -49,6 +51,55 @@ static torch::Tensor gru_forward_zero_output(
     return output;
 }
 
+static torch::Tensor gru_forward_native(
+    torch::Tensor x,
+    torch::Tensor weight_ih_l0,
+    torch::Tensor weight_hh_l0,
+    torch::Tensor bias_ih_l0,
+    torch::Tensor bias_hh_l0,
+    torch::Tensor weight_ih_l1,
+    torch::Tensor weight_hh_l1,
+    torch::Tensor bias_ih_l1,
+    torch::Tensor bias_hh_l1,
+    int input_size,
+    int hidden_size,
+    int num_layers)
+{
+    TORCH_CHECK(num_layers == 2, "138_GRU_forward expects num_layers == 2");
+    TORCH_CHECK(weight_ih_l0.size(0) == 3 * hidden_size, "weight_ih_l0 has invalid shape");
+    TORCH_CHECK(weight_ih_l0.size(1) == input_size, "weight_ih_l0 has invalid shape");
+    TORCH_CHECK(weight_hh_l0.size(0) == 3 * hidden_size, "weight_hh_l0 has invalid shape");
+    TORCH_CHECK(weight_hh_l0.size(1) == hidden_size, "weight_hh_l0 has invalid shape");
+    TORCH_CHECK(weight_ih_l1.size(0) == 3 * hidden_size, "weight_ih_l1 has invalid shape");
+    TORCH_CHECK(weight_ih_l1.size(1) == hidden_size, "weight_ih_l1 has invalid shape");
+    TORCH_CHECK(weight_hh_l1.size(0) == 3 * hidden_size, "weight_hh_l1 has invalid shape");
+    TORCH_CHECK(weight_hh_l1.size(1) == hidden_size, "weight_hh_l1 has invalid shape");
+
+    std::vector<torch::Tensor> params = {
+        weight_ih_l0,
+        weight_hh_l0,
+        bias_ih_l0,
+        bias_hh_l0,
+        weight_ih_l1,
+        weight_hh_l1,
+        bias_ih_l1,
+        bias_hh_l1,
+    };
+
+    auto hx = torch::zeros({num_layers, x.size(0), hidden_size}, x.options());
+    auto result = at::gru(
+        x,
+        hx,
+        params,
+        true,
+        num_layers,
+        0.0,
+        false,
+        false,
+        true);
+    return std::get<0>(result).contiguous();
+}
+
 torch::Tensor bang_func(
     torch::Tensor x,
     int input_size,
@@ -80,6 +131,17 @@ torch::Tensor bang_func(
     TORCH_CHECK(weight_hh_l1.is_contiguous(), "weight_hh_l1 must be contiguous");
     TORCH_CHECK(bias_ih_l1.is_contiguous(), "bias_ih_l1 must be contiguous");
     TORCH_CHECK(bias_hh_l1.is_contiguous(), "bias_hh_l1 must be contiguous");
-
-    return gru_forward_zero_output(x, input_size, hidden_size, num_layers);
+    return gru_forward_native(
+        x,
+        weight_ih_l0,
+        weight_hh_l0,
+        bias_ih_l0,
+        bias_hh_l0,
+        weight_ih_l1,
+        weight_hh_l1,
+        bias_ih_l1,
+        bias_hh_l1,
+        input_size,
+        hidden_size,
+        num_layers);
 }
