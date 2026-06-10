@@ -4,27 +4,58 @@
 
 #define ROWS 128
 #define COLS 4000
-#define TASK_NUM 128
+#define CHUNK_SIZE 4096
+#define TASK_NUM 4
 
-__mlu_entry__ void cumsum_half_to_float_dim1_kernel(
+__mlu_entry__ void cumsum_half_kernel(
     half* input,
-    float* output,
+    half* output,
     int rows,
     int cols
 ) {
-    uint32_t tid = taskId;
-    uint32_t task_num = taskDim;
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
 
-   
-    for (int row = tid; row < rows; row += task_num) {
+    __nram__ half nram_half[CHUNK_SIZE];
+    __nram__ float nram_float[CHUNK_SIZE];
+
+    for (int row = core_id; row < rows; row += core_num) {
         int base = row * cols;
+
+        __memcpy(
+            nram_half,
+            input + base,
+            cols * sizeof(half),
+            GDRAM2NRAM
+        );
+
+        // half -> float
+        __bang_half2float(
+            nram_float,
+            nram_half,
+            cols
+        );
 
         float acc = 0.0f;
 
         for (int col = 0; col < cols; ++col) {
-            acc += (float)input[base + col];
-            output[base + col] = acc;
+            acc += nram_float[col];
+            nram_float[col] = acc;
         }
+
+        // float -> half
+        __bang_float2half(
+            nram_half,
+            nram_float,
+            cols
+        );
+
+        __memcpy(
+            output + base,
+            nram_half,
+            cols * sizeof(half),
+            NRAM2GDRAM
+        );
     }
 }
 
@@ -32,28 +63,24 @@ torch::Tensor bang_func(
     torch::Tensor input,
     int dim
 ) {
-    TORCH_CHECK(input.dim() == 2, "cumsum only supports 2D input for this problem.");
-    TORCH_CHECK(dim == 1 || dim == -1, "cumsum only supports dim = 1 for this problem.");
+    TORCH_CHECK(input.dim() == 2, "cumsum only supports 2D input.");
+    TORCH_CHECK(dim == 1 || dim == -1, "cumsum only supports dim = 1.");
     TORCH_CHECK(input.size(0) == ROWS, "Expected input.size(0) == 128.");
     TORCH_CHECK(input.size(1) == COLS, "Expected input.size(1) == 4000.");
     TORCH_CHECK(input.scalar_type() == torch::kHalf || input.scalar_type() == torch::kFloat16,
-                "This implementation expects float16 input.");
+                "cumsum expects float16 input.");
 
     torch::Tensor x = input.contiguous();
-
-    auto output = torch::empty(
-        {ROWS, COLS},
-        x.options().dtype(torch::kFloat32)
-    );
+    torch::Tensor output = torch::empty_like(x);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t k_dim = {TASK_NUM, 1, 1};
-    cnrtFunctionType_t k_type = cnrtFuncTypeUnion1;
+    cnrtDim3_t dim3 = {TASK_NUM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    cumsum_half_to_float_dim1_kernel<<<k_dim, k_type, queue>>>(
+    cumsum_half_kernel<<<dim3, ktype, queue>>>(
         reinterpret_cast<half*>(x.data_ptr<at::Half>()),
-        output.data_ptr<float>(),
+        reinterpret_cast<half*>(output.data_ptr<at::Half>()),
         ROWS,
         COLS
     );
