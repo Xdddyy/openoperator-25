@@ -4,16 +4,16 @@
 #include <cstdint>
 #include <limits>
 
-#define BLOCK_SIZE 1024  // 用于NRAM分块（本例未使用分块，保留宏定义）
+#define BLOCK_SIZE 1024  // 保留宏定义，实际未使用分块
 
 /**
- * @brief 沿指定维度计算 half 类型张量的最大值索引
- * @param input       输入张量指针 (half)
- * @param output      输出索引张量指针 (int64_t)
- * @param pre         dim 之前各维度大小的乘积
- * @param dim_size    dim 维度的大小
- * @param post        dim 之后各维度大小的乘积
- * @param total_output 输出张量元素总数
+ * @brief 内核：沿指定维度计算最大值索引
+ * @param input        half 输入张量指针
+ * @param output       int64_t 输出索引张量指针
+ * @param pre          dim 之前各维度乘积
+ * @param dim_size     dim 维度大小
+ * @param post         dim 之后各维度乘积
+ * @param total_output 输出元素总数
  */
 __mlu_entry__ void argmax_kernel(half *input, int64_t *output,
                                  int pre, int dim_size, int post,
@@ -21,26 +21,19 @@ __mlu_entry__ void argmax_kernel(half *input, int64_t *output,
     uint32_t task_id = taskId;
     uint32_t task_num = taskDim;
 
-    // 每个任务处理一个输出元素
-    for (uint32_t idx = task_id; idx < (uint32_t)total_output; idx += task_num) {
-        // 计算当前输出元素对应的 pre 索引和 post 索引
+    // 每个任务处理多个输出元素（轮询方式）
+    for (int idx = task_id; idx < total_output; idx += task_num) {
         int pre_idx = idx / post;
         int post_idx = idx % post;
-
-        // 输入中对应向量的起始偏移
         int base = (pre_idx * dim_size * post) + post_idx;
 
-        // 初始化最大值和索引
         float max_val = -std::numeric_limits<float>::infinity();
         int max_idx = 0;
 
-        // 遍历 dim 维度上的所有元素
         for (int k = 0; k < dim_size; ++k) {
-            int offset = base + k * post;
-            half val_half = input[offset];
-            float val_float = __half2float(val_half);
-            if (val_float > max_val) {
-                max_val = val_float;
+            float cur = __half2float(input[base + k * post]);
+            if (cur > max_val) {
+                max_val = cur;
                 max_idx = k;
             }
         }
@@ -49,14 +42,13 @@ __mlu_entry__ void argmax_kernel(half *input, int64_t *output,
 }
 
 /**
- * @brief PyTorch 接口函数
- * @param x   输入张量，类型 torch::kFloat16，连续内存布局
- * @param dim  要规约的维度
- * @return    输出索引张量，类型 torch::kInt64，形状为移除 dim 后的形状
+ * @brief PyTorch 接口函数（名称必须为 bang_func）
+ * @param x   输入张量，连续布局，torch::kFloat16
+ * @param dim 要规约的维度
+ * @return    输出索引张量，torch::kInt64，形状移除 dim 后
  */
-torch::Tensor bang_argmax(torch::Tensor x, int64_t dim) {
-    // 输入检查
-    TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
+torch::Tensor bang_func(torch::Tensor x, int64_t dim) {
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "Input must be float16");
     TORCH_CHECK(dim >= 0 && dim < x.dim(), "Dimension out of range");
 
@@ -66,34 +58,28 @@ torch::Tensor bang_argmax(torch::Tensor x, int64_t dim) {
     for (int64_t i = dim + 1; i < x.dim(); ++i) post *= x.size(i);
     int64_t total_output = pre * post;
 
-    // 创建输出张量 (int64 类型)
-    std::vector<int64_t> output_shape;
+    // 构建输出形状
+    std::vector<int64_t> out_shape;
     for (int64_t i = 0; i < x.dim(); ++i) {
-        if (i != dim) output_shape.push_back(x.size(i));
+        if (i != dim) out_shape.push_back(x.size(i));
     }
-    auto options = torch::TensorOptions().dtype(torch::kInt64).device(x.device());
-    torch::Tensor output = torch::empty(output_shape, options);
+    auto out_opts = torch::TensorOptions().dtype(torch::kInt64).device(x.device());
+    torch::Tensor output = torch::empty(out_shape, out_opts);
 
     // 获取 MLU 队列
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 设置并行任务数 = 输出元素个数，使用 Union1 类型
-    cnrtDim3_t dim3 = {(uint32_t)total_output, 1, 1};
+    // 设置并行维度：使用 Union1 类型，任务数 = 输出元素总数（可设上限）
+    uint32_t task_count = (uint32_t)total_output;
+    cnrtDim3_t dim3 = {task_count, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    // 启动 kernel
+    // 启动内核
     argmax_kernel<<<dim3, ktype, queue>>>(
-        reinterpret_cast<half *>(x.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(x.data_ptr<at::Half>()),
         output.data_ptr<int64_t>(),
         (int)pre, (int)dim_size, (int)post, (int)total_output
     );
 
     return output;
 }
-
-// PyTorch 模块绑定（若需要可加入以下代码）
-/*
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bang_argmax", &bang_argmax, "Argmax on MLU");
-}
-*/
