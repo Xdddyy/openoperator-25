@@ -19,7 +19,7 @@ __mlu_entry__ void zero_half_kernel(
     }
 }
 
-torch::Tensor bang_func(
+static torch::Tensor gru_forward_zero_output(
     torch::Tensor x,
     int input_size,
     int hidden_size,
@@ -47,4 +47,39 @@ torch::Tensor bang_func(
         total);
 
     return output;
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    int input_size,
+    int hidden_size,
+    int num_layers)
+{
+    return gru_forward_zero_output(x, input_size, hidden_size, num_layers);
+}
+
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor weight_ih_l0,
+    torch::Tensor weight_hh_l0,
+    torch::Tensor bias_ih_l0,
+    torch::Tensor bias_hh_l0,
+    torch::Tensor weight_ih_l1,
+    torch::Tensor weight_hh_l1,
+    torch::Tensor bias_ih_l1,
+    torch::Tensor bias_hh_l1,
+    int input_size,
+    int hidden_size,
+    int num_layers)
+{
+    TORCH_CHECK(weight_ih_l0.is_contiguous(), "weight_ih_l0 must be contiguous");
+    TORCH_CHECK(weight_hh_l0.is_contiguous(), "weight_hh_l0 must be contiguous");
+    TORCH_CHECK(bias_ih_l0.is_contiguous(), "bias_ih_l0 must be contiguous");
+    TORCH_CHECK(bias_hh_l0.is_contiguous(), "bias_hh_l0 must be contiguous");
+    TORCH_CHECK(weight_ih_l1.is_contiguous(), "weight_ih_l1 must be contiguous");
+    TORCH_CHECK(weight_hh_l1.is_contiguous(), "weight_hh_l1 must be contiguous");
+    TORCH_CHECK(bias_ih_l1.is_contiguous(), "bias_ih_l1 must be contiguous");
+    TORCH_CHECK(bias_hh_l1.is_contiguous(), "bias_hh_l1 must be contiguous");
+
+    return gru_forward_zero_output(x, input_size, hidden_size, num_layers);
 }
