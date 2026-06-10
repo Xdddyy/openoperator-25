@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <climits>
 
-#define CHUNK_SIZE 4096
 #define CORE_NUM 4
 
 #define CNRT_CHECK_RET(expr)                                      \
@@ -25,61 +24,28 @@ __mlu_entry__ void mse_partial_kernel(
     int total,
     int core_num_arg) {
 
-    uint32_t core_id = taskId;
-    uint32_t core_num = core_num_arg;
+    int core_id = taskId;
+    int core_num = core_num_arg;
 
     if (core_id >= core_num) {
         return;
     }
 
-    uint32_t per_core = total / core_num;
-    uint32_t remainder = total % core_num;
+    int per_core = total / core_num;
+    int remainder = total % core_num;
 
-    uint32_t start = core_id * per_core +
-                     (core_id < remainder ? core_id : remainder);
+    int start = core_id * per_core +
+                (core_id < remainder ? core_id : remainder);
 
-    uint32_t count = per_core +
-                     (core_id < remainder ? 1 : 0);
-
-    __nram__ float nram_pred[CHUNK_SIZE];
-    __nram__ float nram_targ[CHUNK_SIZE];
-    __nram__ float nram_diff[CHUNK_SIZE];
+    int count = per_core +
+                (core_id < remainder ? 1 : 0);
 
     float local_sum = 0.0f;
 
-    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-        uint32_t len =
-            (offset + CHUNK_SIZE <= count)
-                ? CHUNK_SIZE
-                : (count - offset);
-
-        __memcpy(
-            nram_pred,
-            predictions + start + offset,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        __memcpy(
-            nram_targ,
-            targets + start + offset,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-        __bang_sub(
-            nram_diff,
-            nram_pred,
-            nram_targ,
-            len);
-
-        __bang_mul(
-            nram_diff,
-            nram_diff,
-            nram_diff,
-            len);
-
-        for (uint32_t i = 0; i < len; i++) {
-            local_sum += nram_diff[i];
-        }
+    for (int i = 0; i < count; i++) {
+        int pos = start + i;
+        float diff = predictions[pos] - targets[pos];
+        local_sum += diff * diff;
     }
 
     partial_output[core_id] = local_sum;
