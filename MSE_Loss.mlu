@@ -18,35 +18,37 @@
     } while (0)
 
 
-__mlu_entry__ void mse_elementwise_kernel(
+__mlu_entry__ void mse_partial_kernel(
     float *predictions,
     float *targets,
-    float *output,
+    float *partial_output,
     int total,
     int core_num_arg) {
 
-    int core_id = taskId;
-    int core_num = core_num_arg;
+    uint32_t core_id = taskId;
+    uint32_t core_num = core_num_arg;
 
     if (core_id >= core_num) {
         return;
     }
 
-    int per_core = total / core_num;
-    int remainder = total % core_num;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
 
-    int start = core_id * per_core +
-                (core_id < remainder ? core_id : remainder);
+    uint32_t start = core_id * per_core +
+                     (core_id < remainder ? core_id : remainder);
 
-    int count = per_core +
-                (core_id < remainder ? 1 : 0);
+    uint32_t count = per_core +
+                     (core_id < remainder ? 1 : 0);
 
     __nram__ float nram_pred[CHUNK_SIZE];
     __nram__ float nram_targ[CHUNK_SIZE];
-    __nram__ float nram_diff[CHUNK_SIZE];
+    __nram__ float nram_scalar[1];
 
-    for (int offset = 0; offset < count; offset += CHUNK_SIZE) {
-        int len =
+    float local_sum = 0.0f;
+
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len =
             (offset + CHUNK_SIZE <= count)
                 ? CHUNK_SIZE
                 : (count - offset);
@@ -63,24 +65,54 @@ __mlu_entry__ void mse_elementwise_kernel(
             len * sizeof(float),
             GDRAM2NRAM);
 
-        __bang_sub(
-            nram_diff,
-            nram_pred,
-            nram_targ,
-            len);
-
-        __bang_mul(
-            nram_diff,
-            nram_diff,
-            nram_diff,
-            len);
-
-        __memcpy(
-            output + start + offset,
-            nram_diff,
-            len * sizeof(float),
-            NRAM2GDRAM);
+        for (uint32_t i = 0; i < len; i++) {
+            float diff = nram_pred[i] - nram_targ[i];
+            local_sum += diff * diff;
+        }
     }
+
+    nram_scalar[0] = local_sum;
+
+    __memcpy(
+        partial_output + core_id,
+        nram_scalar,
+        sizeof(float),
+        NRAM2GDRAM);
+}
+
+
+__mlu_entry__ void mse_reduce_kernel(
+    float *partial_output,
+    float *output,
+    int total,
+    int core_num_arg) {
+
+    if (taskId != 0) {
+        return;
+    }
+
+    __nram__ float nram_partial[CORE_NUM];
+    __nram__ float nram_out[1];
+
+    __memcpy(
+        nram_partial,
+        partial_output,
+        core_num_arg * sizeof(float),
+        GDRAM2NRAM);
+
+    float global_sum = 0.0f;
+
+    for (int i = 0; i < core_num_arg; i++) {
+        global_sum += nram_partial[i];
+    }
+
+    nram_out[0] = global_sum / (float)total;
+
+    __memcpy(
+        output,
+        nram_out,
+        sizeof(float),
+        NRAM2GDRAM);
 }
 
 
@@ -130,16 +162,34 @@ torch::Tensor bang_func(
 
     int total = static_cast<int>(pred_fp32.numel());
 
-    auto output_fp32 = torch::empty_like(pred_fp32);
+    auto float_options = torch::TensorOptions()
+                             .dtype(torch::kFloat)
+                             .device(pred_fp32.device());
+
+    auto partial_output = torch::empty(
+        {CORE_NUM},
+        float_options);
+
+    auto output_fp32 = torch::empty(
+        {1},
+        float_options);
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cnrtDim3_t dim = {CORE_NUM, 1, 1};
+    cnrtDim3_t dim_partial = {CORE_NUM, 1, 1};
+    cnrtDim3_t dim_reduce = {1, 1, 1};
+
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    mse_elementwise_kernel<<<dim, ktype, queue>>>(
+    mse_partial_kernel<<<dim_partial, ktype, queue>>>(
         pred_fp32.data_ptr<float>(),
         targ_fp32.data_ptr<float>(),
+        partial_output.data_ptr<float>(),
+        total,
+        CORE_NUM);
+
+    mse_reduce_kernel<<<dim_reduce, ktype, queue>>>(
+        partial_output.data_ptr<float>(),
         output_fp32.data_ptr<float>(),
         total,
         CORE_NUM);
@@ -150,5 +200,5 @@ torch::Tensor bang_func(
         output_fp32 = output_fp32.to(original_dtype);
     }
 
-    return output_fp32.reshape(predictions.sizes());
+    return output_fp32.reshape({});
 }
