@@ -2,109 +2,80 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define NRAM_BUF_SIZE 65536
-
-
+#define CHUNK_SIZE 8192
 
 __mlu_entry__ void gemv_kernel(
-    float* A,
-    float* B,
-    float* C,
+    float *A,
+    float *B,
+    float *C,
     int M,
-    int K)
-{
-    // 按行拆分任务
+    int K) {
+
     uint32_t task_id = taskId;
     uint32_t task_num = taskDim;
-    uint32_t per_core_rows = M / task_num;
+    uint32_t per_task = M / task_num;
     uint32_t remainder = M % task_num;
-    uint32_t start_row = task_id * per_core_rows + (task_id < remainder ? task_id : remainder);
-    uint32_t rows = per_core_rows + (task_id < remainder ? 1 : 0);
+    uint32_t start_row = task_id * per_task +
+                         (task_id < remainder ? task_id : remainder);
+    uint32_t count = per_task +
+                     (task_id < remainder ? 1 : 0);
 
-    // 计算每次分块的大小（元素个数）
-    // 双缓冲需要 4 个缓冲区，每个大小相同
-    const uint32_t max_chunk_elems = NRAM_BUF_SIZE / (4 * sizeof(float));
-    uint32_t chunk_size = max_chunk_elems;
-    if (chunk_size > K) chunk_size = K;
-    // 对齐到 64 的倍数（满足 __bang_mul 要求）
-    chunk_size = (chunk_size + 63) & ~63;
-    if (chunk_size == 0) chunk_size = 64;
+    __nram__ float nram_a[CHUNK_SIZE];
+    __nram__ float nram_b[CHUNK_SIZE];
 
-    // 双缓冲缓冲区
-    __nram__ float a_buf0[chunk_size];
-    __nram__ float a_buf1[chunk_size];
-    __nram__ float b_buf0[chunk_size];
-    __nram__ float b_buf1[chunk_size];
-    __nram__ float mul_buf[chunk_size];
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t row = start_row + i;
+        float acc = 0.0f;
 
-    for (uint32_t r = 0; r < rows; ++r) {
-        uint32_t row_idx = start_row + r;
-        float local_sum = 0.0f;
+        for (uint32_t offset = 0; offset < K; offset += CHUNK_SIZE) {
+            uint32_t len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
+            uint32_t aligned_len = (len + 63) & ~63;
 
-        uint32_t offset = 0;
-        // 当前使用的缓冲区指针
-        float *cur_a = a_buf0;
-        float *cur_b = b_buf0;
-        float *next_a = a_buf1;
-        float *next_b = b_buf1;
-
-        // 预取第一个 chunk
-        uint32_t len0 = (K - offset < chunk_size) ? (K - offset) : chunk_size;
-        uint32_t aligned_len0 = (len0 + 63) & ~63;
-        __memcpy(cur_a, A + row_idx * K + offset, len0 * sizeof(float), GDRAM2NRAM);
-        __memcpy(cur_b, B + offset, len0 * sizeof(float), GDRAM2NRAM);
-        offset += len0;
-
-        while (offset < K) {
-            // 预取下一个 chunk
-            uint32_t next_len = (K - offset < chunk_size) ? (K - offset) : chunk_size;
-            uint32_t aligned_next_len = (next_len + 63) & ~63;
-            __memcpy(next_a, A + row_idx * K + offset, next_len * sizeof(float), GDRAM2NRAM);
-            __memcpy(next_b, B + offset, next_len * sizeof(float), GDRAM2NRAM);
-
-            // 计算当前 chunk
-            __bang_mul(mul_buf, cur_a, cur_b, aligned_len0);
-            for (uint32_t i = 0; i < len0; ++i) {
-                local_sum += mul_buf[i];
+            // 1. 加载 B 的片段，并清零尾部以保证向量运算的正确性
+            __memcpy(nram_b, B + offset, len * sizeof(float), GDRAM2NRAM);
+            for (uint32_t j = len; j < aligned_len; ++j) {
+                nram_b[j] = 0.0f;
             }
 
-            // 交换缓冲区，准备处理下一个 chunk
-            float *tmp_a = cur_a;
-            float *tmp_b = cur_b;
-            cur_a = next_a;
-            cur_b = next_b;
-            next_a = tmp_a;
-            next_b = tmp_b;
+            // 2. 加载 A 当前行的片段，并清零尾部
+            __memcpy(nram_a, A + row * K + offset, len * sizeof(float), GDRAM2NRAM);
+            for (uint32_t j = len; j < aligned_len; ++j) {
+                nram_a[j] = 0.0f;
+            }
 
-            offset += next_len;
-            len0 = next_len;
-            aligned_len0 = aligned_next_len;
+            // 3. 向量按位乘法
+            __bang_mul(nram_a, nram_a, nram_b, aligned_len);
+
+            // 4. 将乘积结果累加
+            float partial_sum = 0.0f;
+            for (uint32_t j = 0; j < aligned_len; ++j) {
+                partial_sum += nram_a[j];
+            }
+            acc += partial_sum;
         }
 
-        // 处理最后一个 chunk
-        __bang_mul(mul_buf, cur_a, cur_b, aligned_len0);
-        for (uint32_t i = 0; i < len0; ++i) {
-            local_sum += mul_buf[i];
-        }
-
-        C[row_idx] = local_sum;
+        // 写入最终结果
+        C[row] = acc;
     }
 }
 
-torch::Tensor bang_func(
+
+torch::Tensor gemv_mlu(
     torch::Tensor A,
-    torch::Tensor B)
-{
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
-    TORCH_CHECK(A.dim() == 2, "A must be 2D tensor");
-    TORCH_CHECK(B.dim() == 2, "B must be 2D tensor");
-    TORCH_CHECK(B.size(1) == 1, "B must have shape [K, 1]");
+    torch::Tensor B) {
+
+    // 形状与连续性检查
+    TORCH_CHECK(A.is_contiguous(), "Input tensor A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "Input tensor B must be contiguous");
+    TORCH_CHECK(A.dim() == 2, "A must be a 2D tensor [M, K]");
+    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be a 2D tensor [K, 1]");
+    TORCH_CHECK(A.size(1) == B.size(0),
+                "Inner dimensions must match: A.shape[1] == B.shape[0]");
 
     int M = A.size(0);
     int K = A.size(1);
-    TORCH_CHECK(B.size(0) == K, "B size(0) must match A size(1)");
 
+    // 类型转换，确保计算使用 float
     auto original_dtype = A.scalar_type();
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
@@ -113,20 +84,22 @@ torch::Tensor bang_func(
         B_fp32 = B.to(torch::kFloat);
     }
 
-    auto C = torch::empty({M, 1}, A_fp32.options());
+    auto C_fp32 = torch::empty({M, 1}, A_fp32.options());
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {64, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtDim3_t dim = {32, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     gemv_kernel<<<dim, ktype, queue>>>(
         A_fp32.data_ptr<float>(),
         B_fp32.data_ptr<float>(),
-        C.data_ptr<float>(),
-        M, K);
+        C_fp32.data_ptr<float>(),
+        M,
+        K
+    );
 
     if (original_dtype != torch::kFloat) {
-        return C.to(original_dtype);
+        return C_fp32.to(original_dtype);
     }
-    return C;
+    return C_fp32;
 }
