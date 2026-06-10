@@ -2,6 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+
 #define BLOCK_SIZE 1024
 
 __mlu_entry__ void sqrt_kernel(half *input, half *output, int total) {
