@@ -1,5 +1,5 @@
 // 110_Gather_rows v110_79_idx16
-// v76 的优化版：index D2H 从 int64_t(16KB) 改为 uint16_t(4KB)
+// v76 的优化版：index D2H 从 int64_t(16KB) 改为 uint16_t(4KB).
 // gather 循环里 cast 成 size_t 再用，其他逻辑不变
 #warning "BUILD_VERSION v110_79_idx16"
 
