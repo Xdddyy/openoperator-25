@@ -1,5 +1,5 @@
 // 110_Gather_rows v110_81_input_storage_reuse
-#warning "BUILD_VERSION v110_81_input_storage_reuse"
+#warning "BUILD_VERSION v110_81_input_storage_reuses"
 
 #include <bang.h>
 #include <torch/extension.h>
