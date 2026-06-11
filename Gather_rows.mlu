@@ -1,7 +1,8 @@
-// 110_Gather_rows v110_66_simd_gather_v2
-// v63b 的 CPU gather 循环用 SIMD 向量化 (GCC/ICC auto-vectorization + manual unroll)
-// 核心: 4路展开 + restrict + compiler hints
-#warning "BUILD_VERSION v110_66_simd_gather_v2"
+// 110_Gather_rows v110_70_pinned_memory
+// v66b 的 pinned memory 版本：
+// D2H input/index 用 pinned memory (cnrtMallocHost) 绕过 CPU cache，直接 DMA 到 uncached 区域
+// 消除 g_in/g_idx 写操作时的 cache line fill/evict 开销
+#warning "BUILD_VERSION v110_70_pinned_memory"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -13,55 +14,71 @@
 #define N_COL 1024
 #define K_COL 32
 
-static uint16_t g_in[BATCH * N_COL];
-static  int64_t g_idx[BATCH * K_COL];
-static uint16_t g_out[BATCH * K_COL];
+// Pinned memory buffers — allocated once at first call, reused
+// cnrtMallocHost: page-locked, DMA-direct, bypasses CPU cache
+static uint16_t *g_in_pinned;
+static  int64_t *g_idx_pinned;
+static uint16_t *g_out_pinned;
+static bool g_pinned_init = false;
 
-// 4-way unrolled gather with restrict hints (helps compiler auto-vectorize)
-static inline void gather_row_unroll4(
-    const uint16_t * __restrict__ in_row,
-    const  int64_t * __restrict__ idx_row,
-    uint16_t * __restrict__ out_row
+static void ensure_pinned(void) {
+    if (g_pinned_init) return;
+    cnrtMallocHost((void**)&g_in_pinned,  BATCH * N_COL * sizeof(uint16_t));
+    cnrtMallocHost((void**)&g_idx_pinned, BATCH * K_COL * sizeof(int64_t));
+    cnrtMallocHost((void**)&g_out_pinned, BATCH * K_COL * sizeof(uint16_t));
+    g_pinned_init = true;
+}
+
+// Row-interleaved gather (same as v66b)
+static inline void gather8_interleave(
+    const uint16_t * in_base[8],
+    const  int64_t * idx_base[8],
+    uint16_t * out_base[8]
 ) {
-    const uint16_t *in = (const uint16_t *)in_row;
-    int k = 0;
-    for (; k + 4 <= K_COL; k += 4) {
-        out_row[k+0] = in[(int)idx_row[k+0]];
-        out_row[k+1] = in[(int)idx_row[k+1]];
-        out_row[k+2] = in[(int)idx_row[k+2]];
-        out_row[k+3] = in[(int)idx_row[k+3]];
-    }
-    for (; k < K_COL; ++k) {
-        out_row[k] = in[(int)idx_row[k]];
+    for (int k = 0; k < K_COL; ++k) {
+        #pragma GCC unroll 8
+        for (int r = 0; r < 8; ++r) {
+            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
+        }
     }
 }
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
+    ensure_pinned();
 
-    cnrtMemcpy(g_idx,
+    // D2H to pinned (no cache fill — direct DMA)
+    cnrtMemcpy(g_idx_pinned,
                index.data_ptr<int64_t>(),
                BATCH * K_COL * sizeof(int64_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    cnrtMemcpy(g_in,
+    cnrtMemcpy(g_in_pinned,
                input.data_ptr(),
                BATCH * N_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    for (int b = 0; b < BATCH; ++b) {
-        gather_row_unroll4(g_in + b * N_COL,
-                           g_idx + b * K_COL,
-                           g_out + b * K_COL);
+    // Gather (same row-interleave as v66b)
+    for (int g = 0; g < BATCH; g += 8) {
+        const uint16_t *in_ptrs[8];
+        const  int64_t *idx_ptrs[8];
+        uint16_t *out_ptrs[8];
+        for (int r = 0; r < 8; ++r) {
+            in_ptrs[r]  = g_in_pinned  + (g + r) * N_COL;
+            idx_ptrs[r] = g_idx_pinned + (g + r) * K_COL;
+            out_ptrs[r] = g_out_pinned + (g + r) * K_COL;
+        }
+        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
     }
 
+    // H2D output from pinned
     cnrtMemcpy(output.data_ptr(),
-               g_out,
+               g_out_pinned,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V66] SIMD unroll4\n");
+    fprintf(stderr, "[V70] pinned memory\n");
     fflush(stderr);
 
     return output;
