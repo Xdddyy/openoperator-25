@@ -1,4 +1,4 @@
-// 110_Gather_rows v110_73_align_optimize
+// 110_Gather_rows v110_73_align_optimizer
 // v71 的精简版：去掉 v71 的 ensure_aligned 分支，用 static aligned 数组
 // g_in/g_idx/g_out 全部用 __attribute__((aligned(4096))) 强制对齐
 // 核心优化: 4KB 页对齐让 DMA burst 更长，减少 transaction 数量
