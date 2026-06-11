@@ -1,8 +1,7 @@
-// 110_Gather_rows v110_73_align_optimizer
-// v71 的精简版：去掉 v71 的 ensure_aligned 分支，用 static aligned 数组
-// g_in/g_idx/g_out 全部用 __attribute__((aligned(4096))) 强制对齐
-// 核心优化: 4KB 页对齐让 DMA burst 更长，减少 transaction 数量
-#warning "BUILD_VERSION v110_73_align_optimize"
+// 110_Gather_rows v110_73_align_attr
+// v66b 的进阶版：g_in/g_idx/g_out 用 __attribute__((aligned(4096))) 强制 4KB 对齐
+// 对齐让 DMA burst 更长，减少 PCIe transaction 开销
+#warning "BUILD_VERSION v110_73_align_attr"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -14,10 +13,10 @@
 #define N_COL 1024
 #define K_COL 32
 
-// 4KB页对齐的静态缓冲区（比 posix_memalign 少一次 malloc 开销）
-static alignas(4096) uint16_t g_in[BATCH * N_COL];
-static alignas(4096)  int64_t g_idx[BATCH * K_COL];
-static alignas(4096) uint16_t g_out[BATCH * K_COL];
+// 4KB页对齐的静态缓冲区
+static uint16_t g_in [BATCH * N_COL] __attribute__((aligned(4096)));
+static  int64_t g_idx[BATCH * K_COL] __attribute__((aligned(4096)));
+static uint16_t g_out[BATCH * K_COL] __attribute__((aligned(4096)));
 
 // Row-interleaved gather (same as v66b)
 static inline void gather8_interleave(
@@ -64,7 +63,7 @@ torch::Tensor bang_func(torch::Tensor input,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V73] alignas(4096) static\n");
+    fprintf(stderr, "[V73] __attribute__((aligned(4096)))\n");
     fflush(stderr);
 
     return output;
