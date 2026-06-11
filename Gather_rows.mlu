@@ -1,102 +1,85 @@
-// 110_Gather_rows v110_61_host_memcpy_cpu_gather
-#warning "BUILD_VERSION v110_61_host_memcpy_cpu_gather"
+// 110_Gather_rows v110_77_minimal_d2h_fixed
+// v75 的修复版：__gather 用字面值 elem_size，不依赖 sizeof
+// 同样只 D2H index（16KB），MLU kernel 从 GDRAM 直接 gather
+#warning "BUILD_VERSION v110_77_minimal_d2h_fixed"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
 #include <cstdio>
-#include <cstring>
+#include <stdlib.h>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
+#define TOTAL_K  2048  // BATCH*K_COL，字面值常量
 
-#define INPUT_ELEMS  (BATCH * N_COL)
-#define INDEX_ELEMS  (BATCH * K_COL)
-#define OUTPUT_ELEMS (BATCH * K_COL)
+static  int64_t *g_idx;
+static bool g_init = false;
 
-static uint16_t h_input_half[INPUT_ELEMS];
-static uint16_t h_output_half[OUTPUT_ELEMS];
+static void ensure_init(void) {
+    if (g_init) return;
+    if (posix_memalign((void**)&g_idx, 4096, BATCH * K_COL * sizeof(int64_t)) != 0) g_idx = nullptr;
+    g_init = true;
+}
 
-static float h_input_float[INPUT_ELEMS];
-static float h_output_float[OUTPUT_ELEMS];
+__mlu_entry__ void gather_kernel(
+    const uint16_t * __nram__ input,
+    const  int64_t * __nram__ idx,
+    uint16_t * __nram__ output
+) {
+    if (taskId != 0) return;
 
-static int64_t h_index[INDEX_ELEMS];
+    __nram__ unsigned short off[TOTAL_K];
+    __nram__ uint16_t nram_out[TOTAL_K];
 
-torch::Tensor bang_func(torch::Tensor input, torch::Tensor index) {
-    auto output = torch::empty({BATCH, K_COL}, input.options());
-
-    // 先把 index 拷到 host
-    cnrtMemcpy(
-        h_index,
-        index.data_ptr<int64_t>(),
-        INDEX_ELEMS * sizeof(int64_t),
-        CNRT_MEM_TRANS_DIR_DEV2HOST
-    );
-
-    if (input.scalar_type() == torch::kHalf) {
-        // half 只做 bit-copy，不需要数值转换
-        cnrtMemcpy(
-            h_input_half,
-            input.data_ptr(),
-            INPUT_ELEMS * sizeof(uint16_t),
-            CNRT_MEM_TRANS_DIR_DEV2HOST
-        );
-
-        for (int b = 0; b < BATCH; ++b) {
-            int in_base = b * N_COL;
-            int idx_base = b * K_COL;
-            int out_base = b * K_COL;
-
-            for (int k = 0; k < K_COL; ++k) {
-                int col = (int)h_index[idx_base + k];
-                h_output_half[out_base + k] =
-                    h_input_half[in_base + col];
-            }
+    // Build offset table (element offsets, not bytes)
+    for (int b = 0; b < BATCH; ++b) {
+        int base = b * K_COL;
+        int row  = b * N_COL;
+        for (int k = 0; k < K_COL; ++k) {
+            int v = row + (int)idx[base + k];
+            off[base + k] = (unsigned short)v;
         }
-
-        cnrtMemcpy(
-            output.data_ptr(),
-            h_output_half,
-            OUTPUT_ELEMS * sizeof(uint16_t),
-            CNRT_MEM_TRANS_DIR_HOST2DEV
-        );
-
-    } else if (input.scalar_type() == torch::kFloat32) {
-        cnrtMemcpy(
-            h_input_float,
-            input.data_ptr<float>(),
-            INPUT_ELEMS * sizeof(float),
-            CNRT_MEM_TRANS_DIR_DEV2HOST
-        );
-
-        for (int b = 0; b < BATCH; ++b) {
-            int in_base = b * N_COL;
-            int idx_base = b * K_COL;
-            int out_base = b * K_COL;
-
-            for (int k = 0; k < K_COL; ++k) {
-                int col = (int)h_index[idx_base + k];
-                h_output_float[out_base + k] =
-                    h_input_float[in_base + col];
-            }
-        }
-
-        cnrtMemcpy(
-            output.data_ptr(),
-            h_output_float,
-            OUTPUT_ELEMS * sizeof(float),
-            CNRT_MEM_TRANS_DIR_HOST2DEV
-        );
-
-    } else {
-        TORCH_CHECK(false, "v110_61 supports only float16/float32 input");
     }
 
-    fprintf(stderr,
-            "[HOST_GATHER] dtype=%d\n",
-            (int)input.scalar_type());
+    // __gather: read from GDRAM input via offset, write to NRAM
+    // elem_size=2 (half), src_dir=GDRAM2NRAM
+    __gather(nram_out,
+             input,
+             off,
+             2,            // 字面值常量，不用 sizeof
+             NRAM2NRAM,
+             GDRAM2NRAM,
+             TOTAL_K);
+
+    // NRAM → GDRAM output
+    __memcpy(output, nram_out, TOTAL_K * sizeof(uint16_t), NRAM2GDRAM);
+}
+
+torch::Tensor bang_func(torch::Tensor input,
+                        torch::Tensor index) {
+    auto output = torch::empty({BATCH, K_COL}, input.options());
+    ensure_init();
+
+    // Only D2H index (16KB) — no input D2H
+    cnrtMemcpy(g_idx,
+               index.data_ptr<int64_t>(),
+               BATCH * K_COL * sizeof(int64_t),
+               CNRT_MEM_TRANS_DIR_DEV2HOST);
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    gather_kernel<<<dim, ktype, queue>>>(
+        (const uint16_t*)input.data_ptr(),
+        g_idx,
+        (uint16_t*)output.data_ptr()
+    );
+
+    fprintf(stderr, "[V77] minimal D2H, MLU gather from GDRAM\n");
     fflush(stderr);
 
     return output;
