@@ -4,6 +4,7 @@
 
 #define CHUNK_SIZE 4096
 
+/* GEMV 内核：C = A * B，A [M, K]，B [K]，C [M, 1] */
 __mlu_entry__ void gemv_kernel(
     float *A,
     float *B,
@@ -11,7 +12,7 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    // 多核拆分 M 行
+    // 多核拆分变量（必须在开头声明）
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = M / core_num;
@@ -22,57 +23,49 @@ __mlu_entry__ void gemv_kernel(
     uint32_t count_row = per_core +
                          (core_id < remainder ? 1 : 0);
 
+    // NRAM 缓冲区声明（全部放在开头）
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
     __nram__ float nram_mul[CHUNK_SIZE];
-    __nram__ float nram_acc[1];   // 用于累加的单个元素（向量形式）
+    __nram__ float nram_sum[1];    // 归约结果向量
     __nram__ float nram_out;
 
-    for (uint32_t i = 0; i < count_row; ++i) {
-        uint32_t row = start_row + i;
-        
-        // 初始化累加器为 0
-        __bang_write_zero(nram_acc, 1);
+    // 循环中使用的变量也必须提前声明
+    uint32_t i, row, k, len, aligned_len;
 
-        for (uint32_t k = 0; k < K; k += CHUNK_SIZE) {
-            uint32_t len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
-            uint32_t aligned_len = (len + 63) & ~63;   // 64 字节对齐
+    for (i = 0; i < count_row; ++i) {
+        row = start_row + i;
+        // 累加器初始化为 0
+        nram_sum[0] = 0.0f;
 
-            // 加载 B 片段
+        // 沿 K 方向分块计算点积
+        for (k = 0; k < K; k += CHUNK_SIZE) {
+            len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
+            // 16 个 float 对齐（64 字节），BANG 指令要求
+            aligned_len = (len + 15) & ~15;
+
+            // 1. 加载 B 片段（多余部分清零）
             __bang_write_zero(nram_b, aligned_len);
             __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 加载 A 行片段
+            // 2. 加载 A 当前行片段
             __bang_write_zero(nram_a, aligned_len);
             __memcpy(nram_a, A + row * K + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 逐元素乘
+            // 3. 逐元素乘法
             __bang_mul(nram_mul, nram_a, nram_b, aligned_len);
 
-            // 关键修改：将乘法结果累加到 nram_acc[0]，使用向量加法
-            // nram_acc 只有 1 个元素，与 nram_mul 的对应位置相加
-            // 但 nram_mul 长度较大，不能直接一一对应相加，我们需要把所有元素加起来。
-            // 这里使用迭代归约：不断将 nram_mul 分成两部分相加，直到剩下一个元素。
-            // 但避免使用 reduce_sum，我们手动实现向量加法折半归约。
-            
-            uint32_t reduce_len = aligned_len;
-            while (reduce_len > 1) {
-                uint32_t half = reduce_len / 2;
-                // 将前半部分与后半部分相加，结果存入前半部分
-                __bang_add(nram_mul, nram_mul, nram_mul + half, half);
-                reduce_len = half;
-            }
-            // 现在 nram_mul[0] 是这段点积的和
-            // 累加到 acc
-            __bang_add(nram_acc, nram_acc, nram_mul, 1);
+            // 4. 归约求和（结果存入 nram_sum[0]）
+            __bang_reduce_sum(nram_sum, nram_mul, aligned_len);
         }
 
-        // 写回结果
-        nram_out = nram_acc[0];
+        // 写出结果
+        nram_out = nram_sum[0];
         __memcpy(C + row, &nram_out, sizeof(float), NRAM2GDRAM);
     }
 }
 
+/* PyTorch 入口函数 */
 torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
