@@ -65,10 +65,6 @@ torch::Tensor bang_func(torch::Tensor input,
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {1, 1, 1};
-    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
-
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
     gather_kernel<<<dim, ktype, queue>>>(
