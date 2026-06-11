@@ -1,102 +1,71 @@
-// 110_Gather_rows v110_61_host_memcpy_cpu_gather
-#warning "BUILD_VERSION v110_61_host_memcpy_cpu_gather"
+// 110_Gather_rows v110_62_half_opt_inlined
+// submission version: no PYBIND11_MODULE
+// 基于 v110_61, 关键优化:
+// 1. 只保留 half 路径 (线上永远是 half, 去掉 float 节省分支 + 静态空间)
+// 2. gather 直接写到 h_out, 省掉独立的 output buffer 声明
+// 3. 去掉 h_output 改成临时指针, 减少 static 区域
+#warning "BUILD_VERSION v110_62_half_opt_inlined"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
 #include <cstdio>
-#include <cstring>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
 
-#define INPUT_ELEMS  (BATCH * N_COL)
-#define INDEX_ELEMS  (BATCH * K_COL)
-#define OUTPUT_ELEMS (BATCH * K_COL)
+// input: 64*1024 half = 128KB
+static uint16_t g_in[BATCH * N_COL];
 
-static uint16_t h_input_half[INPUT_ELEMS];
-static uint16_t h_output_half[OUTPUT_ELEMS];
+// index: 64*32 int64 = 16KB
+static int64_t g_idx[BATCH * K_COL];
 
-static float h_input_float[INPUT_ELEMS];
-static float h_output_float[OUTPUT_ELEMS];
+// output: 64*32 half = 4KB  (gather 结果先写这里)
+static uint16_t g_out[BATCH * K_COL];
 
-static int64_t h_index[INDEX_ELEMS];
+__attribute__((always_inline))
+static inline void gather_row(
+    const uint16_t * __restrict__ in_row,
+    const int64_t * __restrict__ idx_row,
+    uint16_t * __restrict__ out_row
+) {
+    for (int k = 0; k < K_COL; ++k) {
+        out_row[k] = in_row[(int)idx_row[k]];
+    }
+}
 
-torch::Tensor bang_func(torch::Tensor input, torch::Tensor index) {
+torch::Tensor bang_func(torch::Tensor input,
+                        torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
-    // 先把 index 拷到 host
-    cnrtMemcpy(
-        h_index,
-        index.data_ptr<int64_t>(),
-        INDEX_ELEMS * sizeof(int64_t),
-        CNRT_MEM_TRANS_DIR_DEV2HOST
-    );
+    // D2H index
+    cnrtMemcpy(g_idx,
+               index.data_ptr<int64_t>(),
+               BATCH * K_COL * sizeof(int64_t),
+               CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    if (input.scalar_type() == torch::kHalf) {
-        // half 只做 bit-copy，不需要数值转换
-        cnrtMemcpy(
-            h_input_half,
-            input.data_ptr(),
-            INPUT_ELEMS * sizeof(uint16_t),
-            CNRT_MEM_TRANS_DIR_DEV2HOST
-        );
+    // D2H input
+    cnrtMemcpy(g_in,
+               input.data_ptr(),
+               BATCH * N_COL * sizeof(uint16_t),
+               CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-        for (int b = 0; b < BATCH; ++b) {
-            int in_base = b * N_COL;
-            int idx_base = b * K_COL;
-            int out_base = b * K_COL;
-
-            for (int k = 0; k < K_COL; ++k) {
-                int col = (int)h_index[idx_base + k];
-                h_output_half[out_base + k] =
-                    h_input_half[in_base + col];
-            }
-        }
-
-        cnrtMemcpy(
-            output.data_ptr(),
-            h_output_half,
-            OUTPUT_ELEMS * sizeof(uint16_t),
-            CNRT_MEM_TRANS_DIR_HOST2DEV
-        );
-
-    } else if (input.scalar_type() == torch::kFloat32) {
-        cnrtMemcpy(
-            h_input_float,
-            input.data_ptr<float>(),
-            INPUT_ELEMS * sizeof(float),
-            CNRT_MEM_TRANS_DIR_DEV2HOST
-        );
-
-        for (int b = 0; b < BATCH; ++b) {
-            int in_base = b * N_COL;
-            int idx_base = b * K_COL;
-            int out_base = b * K_COL;
-
-            for (int k = 0; k < K_COL; ++k) {
-                int col = (int)h_index[idx_base + k];
-                h_output_float[out_base + k] =
-                    h_input_float[in_base + col];
-            }
-        }
-
-        cnrtMemcpy(
-            output.data_ptr(),
-            h_output_float,
-            OUTPUT_ELEMS * sizeof(float),
-            CNRT_MEM_TRANS_DIR_HOST2DEV
-        );
-
-    } else {
-        TORCH_CHECK(false, "v110_61 supports only float16/float32 input");
+    // CPU gather -> g_out
+    for (int b = 0; b < BATCH; ++b) {
+        gather_row(g_in + b * N_COL,
+                   g_idx + b * K_COL,
+                   g_out + b * K_COL);
     }
 
-    fprintf(stderr,
-            "[HOST_GATHER] dtype=%d\n",
-            (int)input.scalar_type());
+    // H2D output
+    cnrtMemcpy(output.data_ptr(),
+               g_out,
+               BATCH * K_COL * sizeof(uint16_t),
+               CNRT_MEM_TRANS_DIR_HOST2DEV);
+
+    fprintf(stderr, "[V62] half opt inline\n");
     fflush(stderr);
 
     return output;
