@@ -1,5 +1,5 @@
-// 110_Gather_rows v110_80_probe_index_stats
-#warning "BUILD_VERSION v110_80_probe_index_stats"
+// 110_Gather_rows v110_82_fused_input_index_d2h
+#warning "BUILD_VERSION v110_82_fused_input_index_d2h"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -7,101 +7,120 @@
 #include <stdint.h>
 #include <cstdlib>
 #include <cstring>
-#include <cstdio>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
 
-#define INDEX_BYTES (BATCH * K_COL * sizeof(int64_t))
+#define INPUT_BYTES  (BATCH * N_COL * sizeof(uint16_t))
+#define INDEX_BYTES  (BATCH * K_COL * sizeof(int64_t))
+#define OUTPUT_BYTES (BATCH * K_COL * sizeof(uint16_t))
+#define PACK_BYTES   (INPUT_BYTES + INDEX_BYTES)
 
-static int64_t *g_idx = nullptr;
+static uint8_t  *g_pack = nullptr;
+static uint16_t *g_out  = nullptr;
 
-static void alloc_and_touch(void) {
-    if (g_idx) return;
-    posix_memalign((void**)&g_idx, 4096, INDEX_BYTES);
-    if (g_idx) memset(g_idx, 0, INDEX_BYTES);
+static void alloc_and_touch_host_buffers(void) {
+    if (g_pack) return;
+
+    posix_memalign((void**)&g_pack, 4096, PACK_BYTES);
+    posix_memalign((void**)&g_out,  4096, OUTPUT_BYTES);
+
+    if (g_pack) memset(g_pack, 0, PACK_BYTES);
+    if (g_out)  memset(g_out,  0, OUTPUT_BYTES);
 }
 
 __attribute__((constructor))
-static void ctor_alloc(void) {
-    alloc_and_touch();
+static void module_ctor_prealloc(void) {
+    alloc_and_touch_host_buffers();
+}
+
+static inline void gather8_interleave(
+    const uint16_t * __restrict__ in_base[8],
+    const int64_t  * __restrict__ idx_base[8],
+    uint16_t       * __restrict__ out_base[8]
+) {
+    for (int k = 0; k < K_COL; ++k) {
+        #pragma GCC unroll 8
+        for (int r = 0; r < 8; ++r) {
+            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
+        }
+    }
 }
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
-    alloc_and_touch();
 
-    cnrtMemcpy(g_idx,
-               index.data_ptr<int64_t>(),
-               INDEX_BYTES,
-               CNRT_MEM_TRANS_DIR_DEV2HOST);
+    uint16_t *g_in = (uint16_t*)g_pack;
+    int64_t  *g_idx = (int64_t*)(g_pack + INPUT_BYTES);
 
-    int total_span = 0;
-    int min_span = 999999;
-    int max_span = 0;
-    int total_unique = 0;
-    int same_as_row0 = 0;
-    int bad = 0;
+    uintptr_t input_addr = (uintptr_t)input.data_ptr();
+    uintptr_t index_addr = (uintptr_t)index.data_ptr<int64_t>();
 
-    for (int b = 0; b < BATCH; ++b) {
-        int mn = 999999;
-        int mx = -1;
+    // 如果 input 和 index 在 device 虚拟地址上连续，
+    // 一次 D2H 把 input+index 全拷回来。
+    if (index_addr == input_addr + INPUT_BYTES) {
+        cnrtRet_t r = cnrtMemcpy(
+            g_pack,
+            input.data_ptr(),
+            PACK_BYTES,
+            CNRT_MEM_TRANS_DIR_DEV2HOST
+        );
 
-        for (int k = 0; k < K_COL; ++k) {
-            int v = (int)g_idx[b * K_COL + k];
+        // 如果 runtime 不允许跨 allocation 连续拷贝，自动回退到 v79 的两次 D2H。
+        if ((int)r != 0) {
+            cnrtMemcpy(
+                g_in,
+                input.data_ptr(),
+                INPUT_BYTES,
+                CNRT_MEM_TRANS_DIR_DEV2HOST
+            );
 
-            if (v < 0 || v >= N_COL) bad++;
-
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
+            cnrtMemcpy(
+                g_idx,
+                index.data_ptr<int64_t>(),
+                INDEX_BYTES,
+                CNRT_MEM_TRANS_DIR_DEV2HOST
+            );
         }
+    } else {
+        cnrtMemcpy(
+            g_in,
+            input.data_ptr(),
+            INPUT_BYTES,
+            CNRT_MEM_TRANS_DIR_DEV2HOST
+        );
 
-        int span = mx - mn + 1;
-        total_span += span;
-
-        if (span < min_span) min_span = span;
-        if (span > max_span) max_span = span;
-
-        int unique = 0;
-        for (int k = 0; k < K_COL; ++k) {
-            int v = (int)g_idx[b * K_COL + k];
-            int seen = 0;
-
-            for (int j = 0; j < k; ++j) {
-                if ((int)g_idx[b * K_COL + j] == v) {
-                    seen = 1;
-                    break;
-                }
-            }
-
-            if (!seen) unique++;
-        }
-
-        total_unique += unique;
-
-        if (b > 0) {
-            int same = 1;
-            for (int k = 0; k < K_COL; ++k) {
-                if (g_idx[b * K_COL + k] != g_idx[k]) {
-                    same = 0;
-                    break;
-                }
-            }
-            same_as_row0 += same;
-        }
+        cnrtMemcpy(
+            g_idx,
+            index.data_ptr<int64_t>(),
+            INDEX_BYTES,
+            CNRT_MEM_TRANS_DIR_DEV2HOST
+        );
     }
 
-    fprintf(stderr,
-            "[IDX_STATS] avg_span=%.2f min_span=%d max_span=%d avg_unique=%.2f same_as_row0=%d/63 bad=%d\n",
-            (double)total_span / BATCH,
-            min_span,
-            max_span,
-            (double)total_unique / BATCH,
-            same_as_row0,
-            bad);
-    fflush(stderr);
+    for (int g = 0; g < BATCH; g += 8) {
+        const uint16_t *in_ptrs[8];
+        const int64_t  *idx_ptrs[8];
+        uint16_t *out_ptrs[8];
+
+        #pragma GCC unroll 8
+        for (int r = 0; r < 8; ++r) {
+            in_ptrs[r]  = g_in  + (g + r) * N_COL;
+            idx_ptrs[r] = g_idx + (g + r) * K_COL;
+            out_ptrs[r] = g_out + (g + r) * K_COL;
+        }
+
+        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
+    }
+
+    cnrtMemcpy(
+        output.data_ptr(),
+        g_out,
+        OUTPUT_BYTES,
+        CNRT_MEM_TRANS_DIR_HOST2DEV
+    );
 
     return output;
 }
