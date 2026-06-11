@@ -2,6 +2,12 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
+#define OC_GROUP 8
+#define H_TILE 32
+#define W_MAX 256
+#define IN_TILE_ELEMS 16384
+#define OUT_TILE_ELEMS (OC_GROUP * H_TILE * W_MAX)
+
 __mlu_entry__ void dilated_conv2d_kernel(
     const float* input,       // [N, C_in, H, W]
     const float* weight,      // [C_out, C_in, kH, kW]
@@ -22,17 +28,6 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int dilation_h,
     int dilation_w)
 {
-    // ========================================================================
-    // 多核拆分: 按 (batch, output_channel) 组合拆分
-    // ========================================================================
-    uint32_t core_id  = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t total_tasks = (uint32_t)(N * C_out);
-    uint32_t per_core  = total_tasks / core_num;
-    uint32_t remainder = total_tasks % core_num;
-    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
-
     // 各维度步长
     int in_batch_stride   = C_in * H * W;
     int in_channel_stride = H * W;
@@ -41,95 +36,115 @@ __mlu_entry__ void dilated_conv2d_kernel(
     int out_batch_stride  = C_out * H_out * W_out;
     int out_oc_stride     = H_out * W_out;
 
-    // ---- NRAM 缓冲区 ----
-    // 按输出宽度分块，固定行缓冲大小，避免 W_out 较大时临时缓冲互相覆盖。
-    const int TILE_W = 256;
-    const int TILE_ELEMS = 8192;
-    __nram__ float nram_out[TILE_ELEMS];
-    __nram__ float nram_in[TILE_W];
-    __nram__ float nram_tmp[TILE_W];
+    __nram__ float nram_in[IN_TILE_ELEMS];
+    __nram__ float nram_out[OUT_TILE_ELEMS];
+    __nram__ float nram_tmp[W_MAX];
 
-    // ========================================================================
-    // 每个 core 处理分配给它的 (n, oc) 对
-    // ========================================================================
-    for (uint32_t t = 0; t < count; t++) {
-        uint32_t task_idx = start + t;
-        int n  = (int)(task_idx / (uint32_t)C_out);
-        int oc = (int)(task_idx % (uint32_t)C_out);
-        float* out_gdram = output + n * out_batch_stride + oc * out_oc_stride;
+    int oc_groups = (C_out + OC_GROUP - 1) / OC_GROUP;
+    int h_tiles = (H_out + H_TILE - 1) / H_TILE;
+    int total_tasks = N * oc_groups * h_tiles;
 
-        for (int ow_tile_start = 0; ow_tile_start < W_out; ow_tile_start += TILE_W) {
-            int cur_tile_w = W_out - ow_tile_start;
-            if (cur_tile_w > TILE_W) cur_tile_w = TILE_W;
+    for (int linear_task = taskId; linear_task < total_tasks; linear_task += taskDim) {
+        int h_tile_id = linear_task % h_tiles;
+        int tmp_task = linear_task / h_tiles;
+        int oc_group_id = tmp_task % oc_groups;
+        int n = tmp_task / oc_groups;
 
-            int tile_h = TILE_ELEMS / cur_tile_w;
-            if (tile_h < 1) tile_h = 1;
+        int oh_tile_start = h_tile_id * H_TILE;
+        int oh_tile_end = oh_tile_start + H_TILE;
+        if (oh_tile_end > H_out) oh_tile_end = H_out;
+        int cur_tile_h = oh_tile_end - oh_tile_start;
 
-            for (int oh_tile_start = 0; oh_tile_start < H_out; oh_tile_start += tile_h) {
-                int oh_tile_end = oh_tile_start + tile_h;
-                if (oh_tile_end > H_out) oh_tile_end = H_out;
-                int cur_tile_h = oh_tile_end - oh_tile_start;
-                int out_tile_size = cur_tile_h * cur_tile_w;
+        int oc_start = oc_group_id * OC_GROUP;
+        int oc_end = oc_start + OC_GROUP;
+        if (oc_end > C_out) oc_end = C_out;
+        int cur_oc = oc_end - oc_start;
 
-                __bang_write_zero(nram_out, out_tile_size);
+        int load_ih_start = oh_tile_start * stride_h - padding_h;
+        if (load_ih_start < 0) load_ih_start = 0;
+        if (load_ih_start > H) load_ih_start = H;
+        int load_ih_end = (oh_tile_end - 1) * stride_h
+                          + (kH - 1) * dilation_h - padding_h + 1;
+        if (load_ih_end < 0) load_ih_end = 0;
+        if (load_ih_end > H) load_ih_end = H;
+        int num_in_rows = load_ih_end - load_ih_start;
+        if (num_in_rows <= 0) continue;
 
-                for (int ic = 0; ic < C_in; ic++) {
-                    const float* in_ch_base =
-                        input + n * in_batch_stride + ic * in_channel_stride;
-                    const float* w_base =
-                        weight + oc * w_oc_stride + ic * w_ic_stride;
+        int in_tile_size = num_in_rows * W;
+        int out_tile_size = cur_oc * cur_tile_h * W_out;
+        if (W_out > W_MAX || W > W_MAX ||
+            in_tile_size > IN_TILE_ELEMS ||
+            out_tile_size > OUT_TILE_ELEMS) {
+            continue;
+        }
 
-                    for (int kh = 0; kh < kH; kh++) {
-                        for (int oh = oh_tile_start; oh < oh_tile_end; oh++) {
-                            int ih = oh * stride_h + kh * dilation_h - padding_h;
-                            if (ih < 0 || ih >= H) continue;
+        __bang_write_zero(nram_out, out_tile_size);
 
-                            int nram_out_row = oh - oh_tile_start;
+        for (int ic = 0; ic < C_in; ic++) {
+            const float* in_ch_base =
+                input + n * in_batch_stride + ic * in_channel_stride;
 
-                            for (int kw = 0; kw < kW; kw++) {
-                                float w_val = w_base[kh * kW + kw];
-                                if (w_val == 0.0f) continue;
+            __memcpy(
+                nram_in,
+                in_ch_base + load_ih_start * W,
+                in_tile_size * sizeof(float),
+                GDRAM2NRAM);
 
-                                int iw_offset = kw * dilation_w - padding_w;
-                                int ow_start = ow_tile_start;
-                                int ow_end = ow_tile_start + cur_tile_w;
+            for (int oc_local = 0; oc_local < cur_oc; oc_local++) {
+                int oc = oc_start + oc_local;
+                const float* w_base = weight + oc * w_oc_stride + ic * w_ic_stride;
+                float* nram_out_oc = nram_out + oc_local * cur_tile_h * W_out;
 
-                                int valid_ow_start = -iw_offset;
-                                if (valid_ow_start < ow_start) valid_ow_start = ow_start;
-                                int valid_ow_end = W - iw_offset;
-                                if (valid_ow_end > ow_end) valid_ow_end = ow_end;
+                for (int kh = 0; kh < kH; kh++) {
+                    for (int oh = oh_tile_start; oh < oh_tile_end; oh++) {
+                        int ih = oh * stride_h + kh * dilation_h - padding_h;
+                        if (ih < 0 || ih >= H) continue;
 
-                                int valid_w = valid_ow_end - valid_ow_start;
-                                if (valid_w <= 0) continue;
+                        int nram_in_row = ih - load_ih_start;
+                        int nram_out_row = oh - oh_tile_start;
+                        float* out_row = nram_out_oc + nram_out_row * W_out;
 
-                                int iw_start = valid_ow_start + iw_offset;
-                                int out_offset = nram_out_row * cur_tile_w +
-                                                 (valid_ow_start - ow_tile_start);
+                        for (int kw = 0; kw < kW; kw++) {
+                            float w_val = w_base[kh * kW + kw];
+                            if (w_val == 0.0f) continue;
 
-                                __memcpy(
-                                    nram_in,
-                                    in_ch_base + ih * W + iw_start,
-                                    valid_w * sizeof(float),
-                                    GDRAM2NRAM);
-                                __bang_mul_scalar(nram_tmp, nram_in, w_val, valid_w);
-                                __bang_add(
-                                    nram_out + out_offset,
-                                    nram_out + out_offset,
-                                    nram_tmp,
-                                    valid_w);
-                            }
+                            int iw_offset = kw * dilation_w - padding_w;
+                            int ow_start = -iw_offset;
+                            if (ow_start < 0) ow_start = 0;
+                            int ow_end = W - iw_offset;
+                            if (ow_end > W_out) ow_end = W_out;
+                            int valid_w = ow_end - ow_start;
+                            if (valid_w <= 0) continue;
+
+                            int iw_start = ow_start + iw_offset;
+                            __bang_mul_scalar(
+                                nram_tmp,
+                                nram_in + nram_in_row * W + iw_start,
+                                w_val,
+                                valid_w);
+                            __bang_add(
+                                out_row + ow_start,
+                                out_row + ow_start,
+                                nram_tmp,
+                                valid_w);
                         }
                     }
                 }
-
-                for (int oh = 0; oh < cur_tile_h; oh++) {
-                    __memcpy(
-                        out_gdram + (oh_tile_start + oh) * W_out + ow_tile_start,
-                        nram_out + oh * cur_tile_w,
-                        cur_tile_w * sizeof(float),
-                        NRAM2GDRAM);
-                }
             }
+        }
+
+        for (int oc_local = 0; oc_local < cur_oc; oc_local++) {
+            int oc = oc_start + oc_local;
+            float* out_gdram = output + n * out_batch_stride
+                               + oc * out_oc_stride
+                               + oh_tile_start * W_out;
+            float* nram_out_oc = nram_out + oc_local * cur_tile_h * W_out;
+
+            __memcpy(
+                out_gdram,
+                nram_out_oc,
+                cur_tile_h * W_out * sizeof(float),
+                NRAM2GDRAM);
         }
     }
 }
