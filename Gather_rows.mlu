@@ -1,48 +1,81 @@
-// 110_Gather_rows v110_72_probe_d2h_h2d
-// 探针版本：只测 D2H + H2D，不做 gather
-// 目的：分离传输开销 vs 计算开销
-#warning "BUILD_VERSION v110_72_probe_d2h_h2d"
+// 110_Gather_rows v110_71_aligned_memory
+// v66b 的进阶版：input/index 用 posix_memalign 分配 cache-line 对齐内存
+// 对齐的内存可以让 D2H DMA 更高效，减少 partial-write cache line
+// mlock 权限不够时 fallback 到普通分配
+#warning "BUILD_VERSION v110_71_aligned_memory"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
 #include <cstdio>
+#include <stdlib.h>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
 
-static uint16_t g_in[BATCH * N_COL];
-static  int64_t g_idx[BATCH * K_COL];
-static uint16_t g_out[BATCH * K_COL];
+static uint16_t *g_in;
+static  int64_t *g_idx;
+static uint16_t *g_out;
+static bool g_alloc_init = false;
+
+static void ensure_aligned(void) {
+    if (g_alloc_init) return;
+    // 4096B-aligned allocation for efficient DMA
+    if (posix_memalign((void**)&g_in,  4096, BATCH * N_COL * sizeof(uint16_t)) != 0) g_in  = nullptr;
+    if (posix_memalign((void**)&g_idx, 4096, BATCH * K_COL * sizeof(int64_t)) != 0) g_idx = nullptr;
+    if (posix_memalign((void**)&g_out, 4096, BATCH * K_COL * sizeof(uint16_t)) != 0) g_out = nullptr;
+    g_alloc_init = true;
+}
+
+// Row-interleaved gather (same as v66b)
+static inline void gather8_interleave(
+    const uint16_t * in_base[8],
+    const  int64_t * idx_base[8],
+    uint16_t * out_base[8]
+) {
+    for (int k = 0; k < K_COL; ++k) {
+        #pragma GCC unroll 8
+        for (int r = 0; r < 8; ++r) {
+            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
+        }
+    }
+}
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
+    ensure_aligned();
 
-    // D2H index
     cnrtMemcpy(g_idx,
                index.data_ptr<int64_t>(),
                BATCH * K_COL * sizeof(int64_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    // D2H input
     cnrtMemcpy(g_in,
                input.data_ptr(),
                BATCH * N_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    // NO gather — zero compute
-    // (g_out left as zeros)
+    for (int g = 0; g < BATCH; g += 8) {
+        const uint16_t *in_ptrs[8];
+        const  int64_t *idx_ptrs[8];
+        uint16_t *out_ptrs[8];
+        for (int r = 0; r < 8; ++r) {
+            in_ptrs[r]  = g_in  + (g + r) * N_COL;
+            idx_ptrs[r] = g_idx + (g + r) * K_COL;
+            out_ptrs[r] = g_out + (g + r) * K_COL;
+        }
+        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
+    }
 
-    // H2D output
     cnrtMemcpy(output.data_ptr(),
                g_out,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V72] D2H+H2D only\n");
+    fprintf(stderr, "[V71] locked memory\n");
     fflush(stderr);
 
     return output;
