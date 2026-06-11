@@ -11,7 +11,6 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    // 多核拆分变量
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = M / core_num;
@@ -22,51 +21,35 @@ __mlu_entry__ void gemv_kernel(
     uint32_t count_row = per_core +
                          (core_id < remainder ? 1 : 0);
 
-    // NRAM 缓冲区
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
     __nram__ float nram_mul[CHUNK_SIZE];
-    __nram__ float nram_sum[1];          // 累加器向量
+    __nram__ float nram_sum[1];
 
-    // 循环控制与归约变量
-    uint32_t i, row, k, len;
+    for (uint32_t i = 0; i < count_row; ++i) {
+        uint32_t row = start_row + i;
+        __bang_write_zero(nram_sum, 1);
 
-    for (i = 0; i < count_row; ++i) {
-        row = start_row + i;
-        __bang_write_zero(nram_sum, 1);   // 初始化累加器
+        for (uint32_t k = 0; k < K; k += CHUNK_SIZE) {
+            uint32_t len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
 
-        for (k = 0; k < K; k += CHUNK_SIZE) {
-            len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
-
-            // 加载 B 片段
-            __bang_write_zero(nram_b, len);  // 只清零有效长度部分
+            // 只初始化有效长度部分
+            __bang_write_zero(nram_b, len);
             __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 加载 A 行片段
             __bang_write_zero(nram_a, len);
             __memcpy(nram_a, A + row * K + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 逐元素乘法
             __bang_mul(nram_mul, nram_a, nram_b, len);
 
-            // 手动折半归约求和（修正版本）
-            uint32_t cur_len = len;
-            while (cur_len > 1) {
-                uint32_t len_half = (cur_len + 1) / 2;  // 向上取半数处理奇数长度
-
-                for (uint32_t idx = 0; idx < cur_len / 2; ++idx) {
-                    nram_mul[idx] += nram_mul[idx + len_half];
-                }
-
-                cur_len = len_half;
+            // 简单for累加，避免复杂归约逻辑导致偏差
+            float sum = 0.f;
+            for (uint32_t idx = 0; idx < len; ++idx) {
+                sum += nram_mul[idx];
             }
-            // nram_mul[0] 现在是该分块的和
-
-            // 向量累加（长度1）
-            __bang_add(nram_sum, nram_sum, nram_mul, 1);
+            nram_sum[0] += sum;
         }
 
-        // 写回结果
         __memcpy(C + row, nram_sum, sizeof(float), NRAM2GDRAM);
     }
 }
