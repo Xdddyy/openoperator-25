@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_77_minimal_d2h_fixed
-// v75 的修复版：__gather 用字面值 elem_size，不依赖 sizeof
-// 同样只 D2H index（16KB），MLU kernel 从 GDRAM 直接 gather
-#warning "BUILD_VERSION v110_77_minimal_d2h_fixed"
+// 110_Gather_rows v110_78_minimal_d2h_v2
+// 修复：__nram__ 只修饰局部数组，不能修饰 kernel 参数
+// 只 D2H index（16KB），MLU kernel 从 GDRAM 直接 gather
+#warning "BUILD_VERSION v110_78_minimal_d2h_v2"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -13,9 +13,9 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define TOTAL_K  2048  // BATCH*K_COL，字面值常量
+#define TOTAL_K  2048  // BATCH*K_COL
 
-static  int64_t *g_idx;
+static int64_t *g_idx;
 static bool g_init = false;
 
 static void ensure_init(void) {
@@ -25,37 +25,36 @@ static void ensure_init(void) {
 }
 
 __mlu_entry__ void gather_kernel(
-    const uint16_t * __nram__ input,
-    const  int64_t * __nram__ idx,
-    uint16_t * __nram__ output
+    const uint16_t *input,  // GDRAM — 不能加 __nram__
+    const  int64_t *idx,   // host-copied g_idx, read as GDRAM pointer in kernel
+    uint16_t *output       // GDRAM — 不能加 __nram__
 ) {
     if (taskId != 0) return;
 
+    // NRAM 局部缓冲区
     __nram__ unsigned short off[TOTAL_K];
     __nram__ uint16_t nram_out[TOTAL_K];
 
-    // Build offset table (element offsets, not bytes)
+    // Build offset table: for row b, col k -> element offset = b*N_COL + idx[b*K_COL+k]
     for (int b = 0; b < BATCH; ++b) {
         int base = b * K_COL;
         int row  = b * N_COL;
         for (int k = 0; k < K_COL; ++k) {
-            int v = row + (int)idx[base + k];
-            off[base + k] = (unsigned short)v;
+            off[base + k] = (unsigned short)(row + (int)idx[base + k]);
         }
     }
 
-    // __gather: read from GDRAM input via offset, write to NRAM
-    // elem_size=2 (half), src_dir=GDRAM2NRAM
+    // __gather: src=GDRAM input (via offset), dst=NRAM nram_out
     __gather(nram_out,
              input,
              off,
-             2,            // 字面值常量，不用 sizeof
+             2,           // elem_size=2 (half)
              NRAM2NRAM,
              GDRAM2NRAM,
              TOTAL_K);
 
     // NRAM → GDRAM output
-    __memcpy(output, nram_out, TOTAL_K * sizeof(uint16_t), NRAM2GDRAM);
+    __memcpy(output, nram_out, TOTAL_K * 2, NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor input,
@@ -79,7 +78,7 @@ torch::Tensor bang_func(torch::Tensor input,
         (uint16_t*)output.data_ptr()
     );
 
-    fprintf(stderr, "[V77] minimal D2H, MLU gather from GDRAM\n");
+    fprintf(stderr, "[V78] minimal D2H, MLU gather from GDRAM\n");
     fflush(stderr);
 
     return output;
