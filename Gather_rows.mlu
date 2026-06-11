@@ -1,6 +1,6 @@
 // 110_Gather_rows v110_76_posix_align_opt
 // v71 的精准复现（117.8us，最佳版本）
-// posix_memalign 4KB 对齐 + row-interleaved gather
+// posix_memalign 4KB 对齐 + row-interleaved gathere
 // 去掉 v74 的 queue 并行（实测无效，D2H 本身串行）
 #warning "BUILD_VERSION v110_76_posix_align_opt"
 
