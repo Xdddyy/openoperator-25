@@ -1,121 +1,117 @@
-// gemv.mlu
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 
 #define CHUNK_SIZE 4096
 
-/**
- * MLU 内核：矩阵向量乘法 GEMV (C = A * B)
- * 多核任务分发：taskDim = {4, 1, 1}，沿 M 维度切分
- * A: [M, K] (行主序)
- * B: [K, 1]
- * C: [M, 1]
- */
-__mlu_entry__ void gemv_kernel(float* A, float* B, float* C, int M, int K) {
-    int tid = taskIdX;
-    int tdim = taskDimX;
+/* GEMV 内核：C = A * B，A 形状 [M, K]，B 形状 [K]，C 形状 [M, 1] */
+__mlu_entry__ void gemv_kernel(
+    float *A,
+    float *B,
+    float *C,
+    int M,
+    int K) {
 
-    // 每核心负责的行范围（假设 M 可被 tdim 整除，M=256 满足）
-    int rows_per_core = M / tdim;
-    int start_row = tid * rows_per_core;
-    int end_row = start_row + rows_per_core;
+    // 多核拆分：沿 M 方向均分行
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = M / core_num;
+    uint32_t remainder = M % core_num;
 
-    // NRAM 变量声明
-    __nram__ float A_row[CHUNK_SIZE];          // A 的一行片段
-    __nram__ float B_chunk[CHUNK_SIZE];        // B 的一个片段
-    __nram__ float partial_sum[64];            // 每行部分和，最多 64 行
-    __nram__ float sum_tmp;                    // 单次归约结果
+    uint32_t start_row = core_id * per_core +
+                         (core_id < remainder ? core_id : remainder);
+    uint32_t count_row = per_core +
+                         (core_id < remainder ? 1 : 0);
 
-    // SRAM 缓冲区，供归约操作使用
-    __sram__ float reduce_buf[CHUNK_SIZE];
+    // NRAM 缓冲区
+    __nram__ float nram_a[CHUNK_SIZE];
+    __nram__ float nram_b[CHUNK_SIZE];
+    __nram__ float nram_mul[CHUNK_SIZE];
+    __nram__ float nram_sum;                 // 归约结果
+    __nram__ float nram_out;                 // 单行结果
 
-    // 初始化部分和为零
-    __bang_write_zero(partial_sum, rows_per_core);
+    // 遍历负责的所有行
+    for (uint32_t i = 0; i < count_row; ++i) {
+        uint32_t row = start_row + i;
+        float accumulator = 0.0f;
 
-    // 沿 K 方向分块处理
-    for (int k = 0; k < K; k += CHUNK_SIZE) {
-        int chunk = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
+        // 沿 K 方向分块计算点积
+        for (uint32_t k = 0; k < K; k += CHUNK_SIZE) {
+            uint32_t len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
+            uint32_t aligned_len = (len + 63) & ~63;   // 64 字节对齐
 
-        // 加载 B 的当前片段到 NRAM
-        __memcpy(B_chunk, B + k, chunk * sizeof(float), GDRAM2NRAM);
+            // 清空缓冲区并加载 B 的片段（超出部分为 0）
+            __bang_write_zero(nram_b, aligned_len);
+            __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
-        // 逐行处理当前核心负责的 A 行
-        for (int r = start_row; r < end_row; ++r) {
-            // 加载 A[r][k:k+chunk] 到 NRAM
-            __memcpy(A_row, A + r * K + k, chunk * sizeof(float), GDRAM2NRAM);
+            // 加载 A 当前行对应片段
+            __bang_write_zero(nram_a, aligned_len);
+            __memcpy(nram_a, A + row * K + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 逐元素相乘
-            __bang_mul(A_row, A_row, B_chunk, chunk);
+            // 逐元素乘法
+            __bang_mul(nram_mul, nram_a, nram_b, aligned_len);
 
-            // 归约求和，使用 SRAM 缓冲区
-            __bang_reduce_sum(&sum_tmp, A_row, chunk, reduce_buf);
+            // 归约求和
+            __bang_reduce_sum(&nram_sum, nram_mul, aligned_len);
 
-            // 累加到该行的部分和 (不可用 +=，需用 BANG API)
-            __bang_add_scalar(
-                partial_sum + (r - start_row),
-                partial_sum + (r - start_row),
-                sum_tmp,
-                1
-            );
+            accumulator += nram_sum;
         }
-    }
 
-    // 将最终结果写回 GDRAM 的 C 向量
-    for (int r = start_row; r < end_row; ++r) {
-        __memcpy(C + r, &partial_sum[r - start_row], sizeof(float), NRAM2GDRAM);
+        // 将结果写入全局内存
+        nram_out = accumulator;
+        __memcpy(C + row, &nram_out, sizeof(float), NRAM2GDRAM);
     }
 }
 
-/**
- * PyTorch 入口函数：接收输入张量，在 MLU 上执行 GEMV，返回输出张量。
- * 内部负责数据迁移至 MLU、初始化 CNRT 环境、配置并启动内核。
- */
-torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 确保输入为 float32 连续张量，并转移到 MLU 设备
-    A = A.to(torch::kMLU).contiguous().to(torch::kFloat32);
-    B = B.to(torch::kMLU).contiguous().to(torch::kFloat32);
+/* PyTorch 调用入口 */
+torch::Tensor gemv_bang(
+    torch::Tensor A,
+    torch::Tensor B) {
 
-    int M = A.size(0);
-    int K = A.size(1);
+    // 基础形状与连续性检查
+    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
+    TORCH_CHECK(A.dim() == 2, "A must be a 2D matrix");
+    TORCH_CHECK(B.dim() == 2 || B.dim() == 1,
+                "B must be a 1D vector or [K, 1] tensor");
 
-    // 创建 MLU 上的输出张量
-    auto C = torch::empty({M, 1}, A.options());
+    int64_t M = A.size(0);
+    int64_t K = A.size(1);
 
-    // 初始化 CNRT 环境（实际应用中 PyTorch 可能已初始化，这里保留以符合接口）
-    cnrtInit(0);
-    cnrtDev_t dev;
-    cnrtGetDevice(&dev);
-    cnrtQueue_t queue;
-    cnrtQueueCreate(&queue);
+    if (B.dim() == 2) {
+        TORCH_CHECK(B.size(0) == K && B.size(1) == 1,
+                    "B shape must be [K, 1]");
+    } else {
+        TORCH_CHECK(B.size(0) == K, "B length must be K");
+    }
 
-    // 内核维度配置，使用 4 核 {4, 1, 1}
+    // 保留原始数据类型，统一转换为 float32 计算
+    auto original_dtype = A.scalar_type();
+    torch::Tensor A_fp32 = A;
+    torch::Tensor B_fp32 = B;
+    if (original_dtype != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+        B_fp32 = B.to(torch::kFloat);
+    }
+
+    // 分配输出张量
+    auto C_fp32 = torch::empty({M, 1}, A_fp32.options());
+
+    // 设置核心参数并启动 kernel
+    cnrtQueue_t queue = nullptr;
     cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t func_type = CNRT_FUNC_TYPE_UNION1;
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
-    // 准备内核参数列表
-    void* A_ptr = A.data_ptr();
-    void* B_ptr = B.data_ptr();
-    void* C_ptr = C.data_ptr();
-    void* args[] = {&A_ptr, &B_ptr, &C_ptr, &M, &K};
+    gemv_kernel<<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        B_fp32.data_ptr<float>(),
+        C_fp32.data_ptr<float>(),
+        static_cast<int>(M),
+        static_cast<int>(K));
 
-    // 启动内核
-    cnrtInvokeKernel_V2(
-        reinterpret_cast<void*>(gemv_kernel),
-        dim,
-        args,
-        func_type,
-        queue
-    );
-    cnrtQueueSync(queue);
-
-    // 清理资源
-    cnrtQueueDestroy(queue);
-
-    return C;
-}
-
-// Python 绑定（PyTorch 扩展机制自动生成）
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &bang_func, "GEMV forward (MLU)");
+    // 转回原始数据类型
+    if (original_dtype != torch::kFloat) {
+        return C_fp32.to(original_dtype);
+    }
+    return C_fp32;
 }
