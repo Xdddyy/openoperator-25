@@ -11,7 +11,7 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    // 多核拆分（变量前置声明）
+    // 多核拆分
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = M / core_num;
@@ -26,23 +26,22 @@ __mlu_entry__ void gemv_kernel(
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
     __nram__ float nram_mul[CHUNK_SIZE];
-    __nram__ float nram_out;
+    __nram__ float nram_sum[1];   // 向量累加器，长度为1
 
-    // 循环控制变量及累加器
-    uint32_t i, row, k, len, aligned_len, t;
-    float accum;
+    // 循环控制变量与归约变量（全部前置声明）
+    uint32_t i, row, k, len, aligned_len;
+    uint32_t reduce_len, half;
 
-    // 遍历本核心负责的行
     for (i = 0; i < count_row; ++i) {
         row = start_row + i;
-        accum = 0.0f;   // 【关键】每行初始化累加器
+        // 累加器初始化为0
+        __bang_write_zero(nram_sum, 1);
 
-        // 沿 K 方向分块
         for (k = 0; k < K; k += CHUNK_SIZE) {
             len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
-            aligned_len = (len + 63) & ~63;   // 64 字节对齐，与参考一致
+            aligned_len = (len + 63) & ~63;   // 64 字节对齐
 
-            // 加载 B 片段（多余部分清零）
+            // 加载 B 片段
             __bang_write_zero(nram_b, aligned_len);
             __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
@@ -53,19 +52,23 @@ __mlu_entry__ void gemv_kernel(
             // 逐元素乘法
             __bang_mul(nram_mul, nram_a, nram_b, aligned_len);
 
-            // 只累加有效元素（len 个），避免填充零干扰
-            for (t = 0; t < len; ++t) {
-                accum += nram_mul[t];
+            // 手动折半归约求和：每次将前后半相加，长度减半，直到1
+            reduce_len = aligned_len;
+            while (reduce_len > 1) {
+                half = reduce_len / 2;
+                __bang_add(nram_mul, nram_mul, nram_mul + half, half);
+                reduce_len = half;
             }
+            // 此时 nram_mul[0] 是这段分块的点积结果
+            // 向量累加（长度1）
+            __bang_add(nram_sum, nram_sum, nram_mul, 1);
         }
 
-        // 写回结果
-        nram_out = accum;
-        __memcpy(C + row, &nram_out, sizeof(float), NRAM2GDRAM);
+        // 写回最终结果
+        __memcpy(C + row, nram_sum, sizeof(float), NRAM2GDRAM);
     }
 }
 
-/* PyTorch 入口函数 */
 torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
