@@ -1,79 +1,82 @@
-// 110_Gather_rows v110_79_idx16
-// v76 的优化版：index D2H 从 int64_t(16KB) 改为 uint16_t(4KB).
-// gather 循环里 cast 成 size_t 再用，其他逻辑不变
-#warning "BUILD_VERSION v110_79_idx16"
+// 110_Gather_rows v110_81_mlu_gather_v2
+// v65 的问题排查版：
+// 1. GDRAM 指针参数不用 __nram__ 修饰（会报编译错误）
+// 2. elem_size 用字面值 2，不用 sizeof
+// 3. offset 用 unsigned short（元素单位，非 byte）
+// 4. 所有 __nram__ 数组移到 kernel 内部
+// 5. taskId==0 保护，kernel 参数只传 GDRAM 基址
+#warning "BUILD_VERSION v110_81_mlu_gather_v2"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
 #include <cstdio>
-#include <stdlib.h>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
+#define TOTAL_OUT (BATCH * K_COL)   // 2048
 
-static uint16_t *g_in;
-static uint16_t *g_idx16;  // uint16_t instead of int64_t — saves 12KB D2H
-static uint16_t *g_out;
-
-static inline void gather8_interleave(
-    const uint16_t * in_base[8],
-    const uint16_t * idx_base[8],  // uint16_t
-    uint16_t * out_base[8]
+// 所有 __nram__ 变量在 kernel 内部声明，不在参数上
+__mlu_entry__ void gather_kernel(
+    const uint16_t *input,   // GDRAM base
+    const int64_t *index,    // GDRAM base
+    uint16_t *output         // GDRAM base
 ) {
-    for (int k = 0; k < K_COL; ++k) {
-        #pragma GCC unroll 8
-        for (int r = 0; r < 8; ++r) {
-            out_base[r][k] = in_base[r][(size_t)idx_base[r][k]];
+    if (taskId != 0) return;
+
+    // NRAM 局部缓冲区
+    __nram__ uint16_t nram_out[TOTAL_OUT];
+    __nram__ unsigned short nram_off[TOTAL_OUT];
+
+    // 构造 offset：行基址 + 索引（元素单位）
+    for (int b = 0; b < BATCH; ++b) {
+        int row_base = b * N_COL;
+        int idx_base = b * K_COL;
+        for (int k = 0; k < K_COL; ++k) {
+            nram_off[idx_base + k] = (unsigned short)(row_base + (int)index[idx_base + k]);
         }
     }
-}
 
-static void ensure_aligned(void) {
-    if (g_in) return;
-    // g_idx16: BATCH*K_COL*2 = 4KB (was 16KB with int64_t)
-    if (posix_memalign((void**)&g_in,    4096, BATCH * N_COL * sizeof(uint16_t)) != 0) g_in    = nullptr;
-    if (posix_memalign((void**)&g_idx16, 4096, BATCH * K_COL * sizeof(uint16_t)) != 0) g_idx16 = nullptr;
-    if (posix_memalign((void**)&g_out,   4096, BATCH * K_COL * sizeof(uint16_t)) != 0) g_out   = nullptr;
+    // __gather: GDRAM -> NRAM, elem_size=2(byte), offset 单位=元素
+    __gather(nram_out,
+             input,
+             nram_off,
+             2,
+             NRAM2NRAM,
+             GDRAM2NRAM,
+             TOTAL_OUT);
+
+    // NRAM -> GDRAM output
+    __memcpy(output,
+             nram_out,
+             TOTAL_OUT * 2,
+             NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
-    ensure_aligned();
 
-    // D2H index as uint16_t (4KB) instead of int64_t (16KB) — saves 12KB
-    cnrtMemcpy(g_idx16,
-               index.data_ptr<int64_t>(),
-               BATCH * K_COL * sizeof(int64_t),
-               CNRT_MEM_TRANS_DIR_DEV2HOST);
+    // 确保张量在 MLU 上连续
+    auto input_cont  = input.contiguous();
+    auto index_cont = index.contiguous();
+    auto output_cont = output.contiguous();
 
-    // D2H full input (128KB) — unavoidable
-    cnrtMemcpy(g_in,
-               input.data_ptr(),
-               BATCH * N_COL * sizeof(uint16_t),
-               CNRT_MEM_TRANS_DIR_DEV2HOST);
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    for (int g = 0; g < BATCH; g += 8) {
-        const uint16_t *in_ptrs[8];
-        const uint16_t *idx_ptrs[8];
-        uint16_t *out_ptrs[8];
-        for (int r = 0; r < 8; ++r) {
-            in_ptrs[r]  = g_in    + (g + r) * N_COL;
-            idx_ptrs[r] = g_idx16 + (g + r) * K_COL;
-            out_ptrs[r] = g_out   + (g + r) * K_COL;
-        }
-        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
-    }
+    // 使用 torch_mlu 当前流
+    torch_mlu::getCurMLUQueue().sync();
+    gather_kernel<<<dim, ktype, torch_mlu::getCurMLUQueue().stream()>>>(
+        (const uint16_t*)input_cont.data_ptr(),
+        (const int64_t*)index_cont.data_ptr(),
+        (uint16_t*)output_cont.data_ptr()
+    );
+    torch_mlu::getCurMLUQueue().sync();
 
-    cnrtMemcpy(output.data_ptr(),
-               g_out,
-               BATCH * K_COL * sizeof(uint16_t),
-               CNRT_MEM_TRANS_DIR_HOST2DEV);
-
-    fprintf(stderr, "[V79] idx uint16_t (4KB D2H), row-interleave\n");
+    fprintf(stderr, "[V81] MLU gather v2\n");
     fflush(stderr);
 
     return output;
