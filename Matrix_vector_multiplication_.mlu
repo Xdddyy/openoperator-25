@@ -1,18 +1,19 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <algorithm>   // for std::min
+#include <algorithm>
 
-#define CHUNK_SIZE 4096
+#define CHUNK_SIZE 4096   // 每次处理的 K 维度分块大小，可调
 
+// ==================== MLU 内核函数 ====================
 __mlu_entry__ void gemv_kernel(
-    float *A,
-    float *B,
-    float *C,
+    float *A,     // 输入矩阵 [M, K]
+    float *B,     // 输入向量 [K]
+    float *C,     // 输出向量 [M]
     int M,
     int K) {
 
-    // 多核拆分
+    // 多核任务划分
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = M / core_num;
@@ -22,52 +23,49 @@ __mlu_entry__ void gemv_kernel(
     uint32_t count_row = per_core +
                          (core_id < remainder ? 1 : 0);
 
-    // NRAM 缓冲区，64字节对齐以满足向量指令要求
+    // NRAM 缓冲区（64字节对齐）
     __nram__ float nram_b[CHUNK_SIZE] __attribute__((aligned(64)));
     __nram__ float nram_a[CHUNK_SIZE] __attribute__((aligned(64)));
     __nram__ float nram_mul[CHUNK_SIZE] __attribute__((aligned(64)));
-    __nram__ float nram_sum[CHUNK_SIZE] __attribute__((aligned(64)));   // 每行累加器
+    __nram__ float nram_sum[CHUNK_SIZE] __attribute__((aligned(64)));   // 存储每行部分和
 
-    // 初始化所有行的累加器为 0
+    // 初始化各行累加器为 0
     __bang_write_zero(nram_sum, count_row);
 
-    // 外层循环：按块遍历 K 维度，每个 B 块只加载一次，多行复用
+    // 外层循环：遍历 K 分块，每个 B 分块只加载一次，被所有行复用
     for (int k = 0; k < K; k += CHUNK_SIZE) {
         int len = std::min(CHUNK_SIZE, K - k);
-        // 按 64 字节对齐（16 个 float）
-        int aligned_len = (len + 15) / 16 * 16;
+        int aligned_len = (len + 15) / 16 * 16;   // 按 16 个 float 对齐（64字节）
 
-        // 加载 B 块到 NRAM
+        // 加载 B 分块
         __bang_write_zero(nram_b, aligned_len);
         __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
-        // 内层循环：处理当前 B 块对应的所有行
+        // 内层循环：处理当前 B 分块对应的所有行
         for (uint32_t i = 0; i < count_row; ++i) {
             uint32_t row = start_row + i;
-            // 加载 A 行片段
+            // 加载 A 的当前行片段
             __bang_write_zero(nram_a, aligned_len);
             __memcpy(nram_a, A + row * K + k, len * sizeof(float), GDRAM2NRAM);
 
             // 逐元素乘法
             __bang_mul(nram_mul, nram_a, nram_b, aligned_len);
 
-            // ---------- 正确归约：处理奇数长度 ----------
+            // ---------- 正确归约（处理任意长度） ----------
             int cur_len = len;
-            // 若当前块长度不为 1，进行折半归约
             while (cur_len > 1) {
-                // 处理奇数长度：将最后一个元素加到 nram_mul[0]
+                // 若长度为奇数，将最后一个元素累加到 nram_mul[0]
                 if (cur_len & 1) {
                     nram_mul[0] += nram_mul[cur_len - 1];
                     cur_len--;
                 }
                 int half = cur_len / 2;
-                // 并行加法：前 half 个元素与后 half 个元素相加
                 __bang_add(nram_mul, nram_mul, nram_mul + half, half);
                 cur_len = half;
             }
-            // 此时 nram_mul[0] 包含当前块的求和结果
+            // 此时 nram_mul[0] 为当前分块的和
 
-            // 累加到该行的总和中（长度为 1 的向量加法）
+            // 累加到该行的总和中
             __bang_add(nram_sum + i, nram_sum + i, nram_mul, 1);
         }
     }
@@ -78,26 +76,28 @@ __mlu_entry__ void gemv_kernel(
     }
 }
 
+// ==================== PyTorch 入口函数 ====================
 torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
 
+    // 输入校验
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be a 2D matrix");
-    TORCH_CHECK(B.dim() == 2 || B.dim() == 1,
-                "B must be a 1D vector or [K,1] tensor");
+    TORCH_CHECK(B.dim() == 1 || (B.dim() == 2 && B.size(1) == 1),
+                "B must be a 1D vector or column vector [K,1]");
 
     int64_t M = A.size(0);
     int64_t K = A.size(1);
 
     if (B.dim() == 2) {
-        TORCH_CHECK(B.size(0) == K && B.size(1) == 1,
-                    "B shape must be [K, 1]");
+        TORCH_CHECK(B.size(0) == K && B.size(1) == 1, "B shape must be [K,1]");
     } else {
         TORCH_CHECK(B.size(0) == K, "B length must be K");
     }
 
+    // 统一为 float32 计算
     auto original_dtype = A.scalar_type();
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
@@ -106,10 +106,12 @@ torch::Tensor bang_func(
         B_fp32 = B.to(torch::kFloat);
     }
 
+    // 分配输出 [M, 1]
     auto C_fp32 = torch::empty({M, 1}, A_fp32.options());
 
-    cnrtQueue_t queue = nullptr;
-    cnrtDim3_t dim = {4, 1, 1};
+    // 启动内核
+    cnrtQueue_t queue = nullptr;               // 使用默认队列
+    cnrtDim3_t dim = {4, 1, 1};                // 4 个 Union1 核
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     gemv_kernel<<<dim, ktype, queue>>>(
@@ -119,11 +121,17 @@ torch::Tensor bang_func(
         static_cast<int>(M),
         static_cast<int>(K));
 
-    // 等待 kernel 完成（队列为 nullptr 时使用默认同步机制）
+    // 同步等待（可选，确保结果可用）
     cnrtQueueSync(queue);
 
+    // 转回原始数据类型（若需要）
     if (original_dtype != torch::kFloat) {
         return C_fp32.to(original_dtype);
     }
     return C_fp32;
 }
+
+// 绑定模块（若需要单独编译为 .so，可添加以下宏）
+// TORCH_LIBRARY(matrix_vector_multiplication, m) {
+//     m.def("bang_func", bang_func);
+// }
