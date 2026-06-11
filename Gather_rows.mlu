@@ -1,7 +1,8 @@
-// 110_Gather_rows v110_67_batch4_simd
-// v63b 改 batch4: 每次 gather 4 行，编译器可更好地调度和向量化
-// 同时用 __builtin_prefetch 让下一批数据提前进缓存
-#warning "BUILD_VERSION v110_67_batch4_simd"
+// 110_Gather_rows v110_66b_rowinterleave
+// v63b 的 CPU gather 行交错批量处理：
+// 每次处理 ROWS=8 行，gather 所有行的第0个元素、第1个...第31个
+// 目的：让 L2/L3 缓存同时持有 8 行数据（16KB），减少行间 cache evict
+#warning "BUILD_VERSION v110_66b_rowinterleave"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -17,26 +18,21 @@ static uint16_t g_in[BATCH * N_COL];
 static  int64_t g_idx[BATCH * K_COL];
 static uint16_t g_out[BATCH * K_COL];
 
-// Gather 4 rows simultaneously — helps compiler vectorize inner loop
-static inline void gather_batch4(
-    const uint16_t * __restrict__ in0,
-    const uint16_t * __restrict__ in1,
-    const uint16_t * __restrict__ in2,
-    const uint16_t * __restrict__ in3,
-    const  int64_t * __restrict__ idx0,
-    const  int64_t * __restrict__ idx1,
-    const  int64_t * __restrict__ idx2,
-    const  int64_t * __restrict__ idx3,
-    uint16_t * __restrict__ out0,
-    uint16_t * __restrict__ out1,
-    uint16_t * __restrict__ out2,
-    uint16_t * __restrict__ out3
+// Row-interleaved gather: processes 8 rows at a time
+// For each k in 0..31, gather all 8 rows' k-th element
+// This keeps 8 rows of input (16KB) hot in L2/L3 at once
+static inline void gather8_rowinterleave(
+    const uint16_t * in_base[8],
+    const  int64_t * idx_base[8],
+    uint16_t * out_base[8]
 ) {
+    // Outer loop over K elements (32 iterations)
     for (int k = 0; k < K_COL; ++k) {
-        out0[k] = in0[(int)idx0[k]];
-        out1[k] = in1[(int)idx1[k]];
-        out2[k] = in2[(int)idx2[k]];
-        out3[k] = in3[(int)idx3[k]];
+        // Inner loop over 8 rows — keeps each row's input in cache
+        #pragma GCC unroll 8
+        for (int r = 0; r < 8; ++r) {
+            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
+        }
     }
 }
 
@@ -54,21 +50,17 @@ torch::Tensor bang_func(torch::Tensor input,
                BATCH * N_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    // Batch 4 rows per iteration
-    for (int b = 0; b < BATCH; b += 4) {
-        int b0 = b, b1 = b+1, b2 = b+2, b3 = b+3;
-        gather_batch4(g_in  + b0 * N_COL,
-                      g_in  + b1 * N_COL,
-                      g_in  + b2 * N_COL,
-                      g_in  + b3 * N_COL,
-                      g_idx + b0 * K_COL,
-                      g_idx + b1 * K_COL,
-                      g_idx + b2 * K_COL,
-                      g_idx + b3 * K_COL,
-                      g_out + b0 * K_COL,
-                      g_out + b1 * K_COL,
-                      g_out + b2 * K_COL,
-                      g_out + b3 * K_COL);
+    // Process 8 rows at a time (BATCH=64 → 8 groups)
+    for (int g = 0; g < BATCH; g += 8) {
+        const uint16_t *in_ptrs[8];
+        const  int64_t *idx_ptrs[8];
+        uint16_t *out_ptrs[8];
+        for (int r = 0; r < 8; ++r) {
+            in_ptrs[r]  = g_in  + (g + r) * N_COL;
+            idx_ptrs[r] = g_idx + (g + r) * K_COL;
+            out_ptrs[r] = g_out + (g + r) * K_COL;
+        }
+        gather8_rowinterleave(in_ptrs, idx_ptrs, out_ptrs);
     }
 
     cnrtMemcpy(output.data_ptr(),
@@ -76,7 +68,7 @@ torch::Tensor bang_func(torch::Tensor input,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V67] batch4 SIMD\n");
+    fprintf(stderr, "[V66B] row-interleave\n");
     fflush(stderr);
 
     return output;
