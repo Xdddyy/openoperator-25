@@ -1,6 +1,7 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <algorithm>   // for std::min
 
 #define CHUNK_SIZE 4096
 
@@ -11,39 +12,38 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    // 多核拆分变量
+    // 多核拆分
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = M / core_num;
     uint32_t remainder = M % core_num;
-
     uint32_t start_row = core_id * per_core +
                          (core_id < remainder ? core_id : remainder);
     uint32_t count_row = per_core +
                          (core_id < remainder ? 1 : 0);
 
-    // NRAM 缓冲区
-    __nram__ float nram_a[CHUNK_SIZE];
-    __nram__ float nram_b[CHUNK_SIZE];
-    __nram__ float nram_mul[CHUNK_SIZE];
-    __nram__ float nram_sum[1];          // 累加器向量
+    // NRAM 缓冲区，64字节对齐以满足向量指令要求
+    __nram__ float nram_b[CHUNK_SIZE] __attribute__((aligned(64)));
+    __nram__ float nram_a[CHUNK_SIZE] __attribute__((aligned(64)));
+    __nram__ float nram_mul[CHUNK_SIZE] __attribute__((aligned(64)));
+    __nram__ float nram_sum[CHUNK_SIZE] __attribute__((aligned(64)));   // 每行累加器
 
-    // 循环控制与归约变量（全部前置声明）
-    uint32_t i, row, k, len, aligned_len;
-    uint32_t cur_len, len_half;          // 用于折半归约的安全变量名
+    // 初始化所有行的累加器为 0
+    __bang_write_zero(nram_sum, count_row);
 
-    for (i = 0; i < count_row; ++i) {
-        row = start_row + i;
-        __bang_write_zero(nram_sum, 1);   // 初始化累加器
+    // 外层循环：按块遍历 K 维度，每个 B 块只加载一次，多行复用
+    for (int k = 0; k < K; k += CHUNK_SIZE) {
+        int len = std::min(CHUNK_SIZE, K - k);
+        // 按 64 字节对齐（16 个 float）
+        int aligned_len = (len + 15) / 16 * 16;
 
-        for (k = 0; k < K; k += CHUNK_SIZE) {
-            len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
-            aligned_len = (len + 63) & ~63;   // 64 字节对齐
+        // 加载 B 块到 NRAM
+        __bang_write_zero(nram_b, aligned_len);
+        __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 加载 B 片段
-            __bang_write_zero(nram_b, aligned_len);
-            __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
-
+        // 内层循环：处理当前 B 块对应的所有行
+        for (uint32_t i = 0; i < count_row; ++i) {
+            uint32_t row = start_row + i;
             // 加载 A 行片段
             __bang_write_zero(nram_a, aligned_len);
             __memcpy(nram_a, A + row * K + k, len * sizeof(float), GDRAM2NRAM);
@@ -51,21 +51,30 @@ __mlu_entry__ void gemv_kernel(
             // 逐元素乘法
             __bang_mul(nram_mul, nram_a, nram_b, aligned_len);
 
-            // 手动折半归约求和（替代 __bang_reduce_sum）
-            cur_len = aligned_len;
+            // ---------- 正确归约：处理奇数长度 ----------
+            int cur_len = len;
+            // 若当前块长度不为 1，进行折半归约
             while (cur_len > 1) {
-                len_half = cur_len / 2;
-                __bang_add(nram_mul, nram_mul, nram_mul + len_half, len_half);
-                cur_len = len_half;
+                // 处理奇数长度：将最后一个元素加到 nram_mul[0]
+                if (cur_len & 1) {
+                    nram_mul[0] += nram_mul[cur_len - 1];
+                    cur_len--;
+                }
+                int half = cur_len / 2;
+                // 并行加法：前 half 个元素与后 half 个元素相加
+                __bang_add(nram_mul, nram_mul, nram_mul + half, half);
+                cur_len = half;
             }
-            // nram_mul[0] 现在是该分块的和
+            // 此时 nram_mul[0] 包含当前块的求和结果
 
-            // 向量累加（长度1）
-            __bang_add(nram_sum, nram_sum, nram_mul, 1);
+            // 累加到该行的总和中（长度为 1 的向量加法）
+            __bang_add(nram_sum + i, nram_sum + i, nram_mul, 1);
         }
+    }
 
-        // 写回结果
-        __memcpy(C + row, nram_sum, sizeof(float), NRAM2GDRAM);
+    // 写回结果
+    for (uint32_t i = 0; i < count_row; ++i) {
+        __memcpy(C + start_row + i, nram_sum + i, sizeof(float), NRAM2GDRAM);
     }
 }
 
@@ -109,6 +118,9 @@ torch::Tensor bang_func(
         C_fp32.data_ptr<float>(),
         static_cast<int>(M),
         static_cast<int>(K));
+
+    // 等待 kernel 完成（队列为 nullptr 时使用默认同步机制）
+    cnrtQueueSync(queue);
 
     if (original_dtype != torch::kFloat) {
         return C_fp32.to(original_dtype);
