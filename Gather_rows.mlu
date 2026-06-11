@@ -1,9 +1,10 @@
-// 110_Gather_rows v110_78_pinned_host_gather
-#warning "BUILD_VERSION v110_78_pinned_host_gather"
+// 110_Gather_rows v110_78b_cnMallocHost_pinned_host_gather
+#warning "BUILD_VERSION v110_78b_cnMallocHost_pinned_host_gather"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <cn_api.h>
 #include <stdint.h>
 #include <cstdio>
 
@@ -11,34 +12,42 @@
 #define N_COL 1024
 #define K_COL 32
 
-static uint16_t *g_in = nullptr;
+#define INPUT_ELEMS  (BATCH * N_COL)
+#define INDEX_ELEMS  (BATCH * K_COL)
+#define OUTPUT_ELEMS (BATCH * K_COL)
+
+static uint16_t *g_in  = nullptr;
 static int64_t  *g_idx = nullptr;
 static uint16_t *g_out = nullptr;
-
-static inline void gather8_interleave(
-    const uint16_t *in_base[8],
-    const int64_t  *idx_base[8],
-    uint16_t *out_base[8]
-) {
-    for (int k = 0; k < K_COL; ++k) {
-        #pragma GCC unroll 8
-        for (int r = 0; r < 8; ++r) {
-            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
-        }
-    }
-}
 
 static void ensure_buf(void) {
     if (g_in) return;
 
-    cnrtMallocHost((void**)&g_in,
-                   BATCH * N_COL * sizeof(uint16_t));
+    CNresult r0 = cnMallocHost((void**)&g_in,
+                               INPUT_ELEMS * sizeof(uint16_t));
+    CNresult r1 = cnMallocHost((void**)&g_idx,
+                               INDEX_ELEMS * sizeof(int64_t));
+    CNresult r2 = cnMallocHost((void**)&g_out,
+                               OUTPUT_ELEMS * sizeof(uint16_t));
 
-    cnrtMallocHost((void**)&g_idx,
-                   BATCH * K_COL * sizeof(int64_t));
+    fprintf(stderr,
+            "[V78B_ALLOC] cnMallocHost ret=%d,%d,%d ptr=%p,%p,%p\n",
+            (int)r0, (int)r1, (int)r2,
+            (void*)g_in, (void*)g_idx, (void*)g_out);
+    fflush(stderr);
+}
 
-    cnrtMallocHost((void**)&g_out,
-                   BATCH * K_COL * sizeof(uint16_t));
+static inline void cpu_gather_half(void) {
+    for (int b = 0; b < BATCH; ++b) {
+        const uint16_t *in_row = g_in + b * N_COL;
+        const int64_t  *idx_row = g_idx + b * K_COL;
+        uint16_t *out_row = g_out + b * K_COL;
+
+        #pragma GCC unroll 32
+        for (int k = 0; k < K_COL; ++k) {
+            out_row[k] = in_row[(int)idx_row[k]];
+        }
+    }
 }
 
 torch::Tensor bang_func(torch::Tensor input,
@@ -46,36 +55,29 @@ torch::Tensor bang_func(torch::Tensor input,
     auto output = torch::empty({BATCH, K_COL}, input.options());
     ensure_buf();
 
-    cnrtMemcpy(g_idx,
-               index.data_ptr<int64_t>(),
-               BATCH * K_COL * sizeof(int64_t),
-               CNRT_MEM_TRANS_DIR_DEV2HOST);
+    if (input.scalar_type() == torch::kHalf) {
+        cnrtMemcpy(g_idx,
+                   index.data_ptr<int64_t>(),
+                   INDEX_ELEMS * sizeof(int64_t),
+                   CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    cnrtMemcpy(g_in,
-               input.data_ptr(),
-               BATCH * N_COL * sizeof(uint16_t),
-               CNRT_MEM_TRANS_DIR_DEV2HOST);
+        cnrtMemcpy(g_in,
+                   input.data_ptr(),
+                   INPUT_ELEMS * sizeof(uint16_t),
+                   CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    for (int g = 0; g < BATCH; g += 8) {
-        const uint16_t *in_ptrs[8];
-        const int64_t  *idx_ptrs[8];
-        uint16_t *out_ptrs[8];
+        cpu_gather_half();
 
-        for (int r = 0; r < 8; ++r) {
-            in_ptrs[r]  = g_in  + (g + r) * N_COL;
-            idx_ptrs[r] = g_idx + (g + r) * K_COL;
-            out_ptrs[r] = g_out + (g + r) * K_COL;
-        }
+        cnrtMemcpy(output.data_ptr(),
+                   g_out,
+                   OUTPUT_ELEMS * sizeof(uint16_t),
+                   CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
+    } else {
+        TORCH_CHECK(false, "v110_78b only supports half");
     }
 
-    cnrtMemcpy(output.data_ptr(),
-               g_out,
-               BATCH * K_COL * sizeof(uint16_t),
-               CNRT_MEM_TRANS_DIR_HOST2DEV);
-
-    fprintf(stderr, "[V78] pinned host gather\n");
+    fprintf(stderr, "[V78B] cnMallocHost pinned host gather\n");
     fflush(stderr);
 
     return output;
