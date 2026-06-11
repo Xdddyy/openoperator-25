@@ -1,8 +1,7 @@
-// 110_Gather_rows v110_68_rowinterleave16_prefetch
-// v66b 的进阶版：batch16 (而非8) + prefetch 下一 batch 的行到 L1
-// 行间 prefetch: 在处理 batch[i] 的 gather 时，异步把 batch[i+1] 的行 load 进 L1
-// 理论: 把行数据保持在 L1，gather 时不触发 cache miss
-#warning "BUILD_VERSION v110_68_rowinterleave16_prefetch"
+// 110_Gather_rows v110_72_probe_d2h_h2d
+// 探针版本：只测 D2H + H2D，不做 gather
+// 目的：分离传输开销 vs 计算开销
+#warning "BUILD_VERSION v110_72_probe_d2h_h2d"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -18,55 +17,32 @@ static uint16_t g_in[BATCH * N_COL];
 static  int64_t g_idx[BATCH * K_COL];
 static uint16_t g_out[BATCH * K_COL];
 
-// Row-interleaved gather with explicit prefetch: processes BATCH rows at a time
-// For each k in 0..31, gather all BATCH rows' k-th element
-// Input rows are prefetched into L1 via streaming loads
-static inline void gather_all_prefetch(
-    const uint16_t * __restrict__ in_base,
-    const  int64_t * __restrict__ idx_base,
-    uint16_t * __restrict__ out_base
-) {
-    // Prefetch all 64 input rows into L1 cache
-    // Each row is 2KB; 64 rows = 128KB
-    // Prefetch distance: 8 rows ahead of processing
-    for (int r = 0; r < BATCH; ++r) {
-        const uint16_t *row_ptr = in_base + r * N_COL;
-        // Prefetch 2KB (the whole row) into L1
-        __builtin_prefetch(row_ptr, 0, 3); // read, L1 cache
-    }
-
-    // Row-interleave: for each K, gather all rows
-    for (int k = 0; k < K_COL; ++k) {
-        #pragma GCC unroll 4
-        for (int r = 0; r < BATCH; ++r) {
-            out_base[r * K_COL + k] = in_base[r * N_COL + (int)idx_base[r * K_COL + k]];
-        }
-    }
-}
-
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
+    // D2H index
     cnrtMemcpy(g_idx,
                index.data_ptr<int64_t>(),
                BATCH * K_COL * sizeof(int64_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
+    // D2H input
     cnrtMemcpy(g_in,
                input.data_ptr(),
                BATCH * N_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    // Process all 64 rows in one row-interleave pass with prefetch
-    gather_all_prefetch(g_in, g_idx, g_out);
+    // NO gather — zero compute
+    // (g_out left as zeros)
 
+    // H2D output
     cnrtMemcpy(output.data_ptr(),
                g_out,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V68] row-interleave64 prefetch\n");
+    fprintf(stderr, "[V72] D2H+H2D only\n");
     fflush(stderr);
 
     return output;
