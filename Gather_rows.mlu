@@ -1,10 +1,7 @@
-// 110_Gather_rows v110_62_half_opt_inlined
-// submission version: no PYBIND11_MODULE
-// 基于 v110_61, 关键优化:
-// 1. 只保留 half 路径 (线上永远是 half, 去掉 float 节省分支 + 静态空间)
-// 2. gather 直接写到 h_out, 省掉独立的 output buffer 声明
-// 3. 去掉 h_output 改成临时指针, 减少 static 区域
-#warning "BUILD_VERSION v110_62_half_opt_inlined"
+// 110_Gather_rows v110_63a_half_no_always_inline
+// 基于 v110_62, 去掉了 __attribute__((always_inline))
+// 保留 __restrict__
+#warning "BUILD_VERSION v110_63a_half_no_always_inline"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -22,10 +19,9 @@ static uint16_t g_in[BATCH * N_COL];
 // index: 64*32 int64 = 16KB
 static int64_t g_idx[BATCH * K_COL];
 
-// output: 64*32 half = 4KB  (gather 结果先写这里)
+// output: 64*32 half = 4KB
 static uint16_t g_out[BATCH * K_COL];
 
-__attribute__((always_inline))
 static inline void gather_row(
     const uint16_t * __restrict__ in_row,
     const int64_t * __restrict__ idx_row,
@@ -65,7 +61,7 @@ torch::Tensor bang_func(torch::Tensor input,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V62] half opt inline\n");
+    fprintf(stderr, "[V63A] no always_inline\n");
     fflush(stderr);
 
     return output;
