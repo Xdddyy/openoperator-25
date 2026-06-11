@@ -4,7 +4,6 @@
 
 #define CHUNK_SIZE 4096
 
-/* GEMV 内核：C = A * B，A [M, K]，B [K]，C [M, 1] */
 __mlu_entry__ void gemv_kernel(
     float *A,
     float *B,
@@ -12,7 +11,7 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    // 多核拆分变量（必须在开头声明）
+    // 多核拆分（变量前置声明）
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = M / core_num;
@@ -23,44 +22,45 @@ __mlu_entry__ void gemv_kernel(
     uint32_t count_row = per_core +
                          (core_id < remainder ? 1 : 0);
 
-    // NRAM 缓冲区声明（全部放在开头）
+    // NRAM 缓冲区
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
     __nram__ float nram_mul[CHUNK_SIZE];
-    __nram__ float nram_sum[1];    // 归约结果向量
     __nram__ float nram_out;
 
-    // 循环中使用的变量也必须提前声明
-    uint32_t i, row, k, len, aligned_len;
+    // 循环控制变量及累加器
+    uint32_t i, row, k, len, aligned_len, t;
+    float accum;
 
+    // 遍历本核心负责的行
     for (i = 0; i < count_row; ++i) {
         row = start_row + i;
-        // 累加器初始化为 0
-        nram_sum[0] = 0.0f;
+        accum = 0.0f;   // 【关键】每行初始化累加器
 
-        // 沿 K 方向分块计算点积
+        // 沿 K 方向分块
         for (k = 0; k < K; k += CHUNK_SIZE) {
             len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
-            // 16 个 float 对齐（64 字节），BANG 指令要求
-            aligned_len = (len + 15) & ~15;
+            aligned_len = (len + 63) & ~63;   // 64 字节对齐，与参考一致
 
-            // 1. 加载 B 片段（多余部分清零）
+            // 加载 B 片段（多余部分清零）
             __bang_write_zero(nram_b, aligned_len);
             __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 2. 加载 A 当前行片段
+            // 加载 A 行片段
             __bang_write_zero(nram_a, aligned_len);
             __memcpy(nram_a, A + row * K + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 3. 逐元素乘法
+            // 逐元素乘法
             __bang_mul(nram_mul, nram_a, nram_b, aligned_len);
 
-            // 4. 归约求和（结果存入 nram_sum[0]）
-            __bang_reduce_sum(nram_sum, nram_mul, aligned_len);
+            // 只累加有效元素（len 个），避免填充零干扰
+            for (t = 0; t < len; ++t) {
+                accum += nram_mul[t];
+            }
         }
 
-        // 写出结果
-        nram_out = nram_sum[0];
+        // 写回结果
+        nram_out = accum;
         __memcpy(C + row, &nram_out, sizeof(float), NRAM2GDRAM);
     }
 }
