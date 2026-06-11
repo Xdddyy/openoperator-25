@@ -1,90 +1,50 @@
-/*-------------------------
-  1. 多核拆分: 按 M 行分配
--------------------------*/
-uint32_t core_id = taskId;
-uint32_t core_num = taskDim;
+// 行拆分
+uint32_t base_rows = M / cnum;
+uint32_t extra = M % cnum;
 
-uint32_t per_core = M / core_num;
-uint32_t remainder = M % core_num;
+uint32_t row_start = cid * base_rows + (cid < extra ? cid : extra);
+uint32_t row_cnt   = base_rows + (cid < extra ? 1 : 0);
 
-uint32_t row_start =
-    core_id * per_core +
-    (core_id < remainder ? core_id : remainder);
+// NRAM buffers
+__nram__ float bufA[CHUNK_SIZE];
+__nram__ float bufB[CHUNK_SIZE];
+__nram__ float bufM[CHUNK_SIZE];
 
-uint32_t row_count =
-    per_core +
-    (core_id < remainder ? 1 : 0);
-
-
-/*-------------------------
-  2. NRAM buffer
--------------------------*/
-__nram__ float nram_A[CHUNK_SIZE];
-__nram__ float nram_B[CHUNK_SIZE];
-__nram__ float nram_mul[CHUNK_SIZE];
-
-
-/*-------------------------
-  3. 遍历每一行做点积
--------------------------*/
-for (uint32_t r = 0; r < row_count; ++r) {
-
-    int row_index = row_start + r;
+// 遍历每一行
+for (uint32_t r = 0; r < row_cnt; ++r) {
+    int row_idx = row_start + r;
     float acc = 0.0f;
 
-    /*-------------------------
-      4. K 方向分块
-    -------------------------*/
-    for (uint32_t offset = 0; offset < (uint32_t)K; offset += CHUNK_SIZE) {
+    // K 方向分块
+    for (uint32_t off = 0; off < (uint32_t)K; off += CHUNK_SIZE) {
 
-        uint32_t len =
-            (offset + CHUNK_SIZE <= (uint32_t)K)
-                ? CHUNK_SIZE
-                : (K - offset);
+        uint32_t len = (off + CHUNK_SIZE <= (uint32_t)K)
+                       ? CHUNK_SIZE
+                       : (K - off);
 
-        uint32_t aligned_len = (len + 63) & ~63;
+        uint32_t alen = (len + 63) & ~63;
 
+        // load A row part
+        __memcpy(bufA,
+                 A + row_idx * K + off,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
 
-        /*-------------------------
-          5. 搬运 A[row, k:k+len]
-        -------------------------*/
-        __memcpy(
-            nram_A,
-            A + row_index * K + offset,
-            len * sizeof(float),
-            GDRAM2NRAM);
+        // load B part
+        __memcpy(bufB,
+                 B + off,
+                 len * sizeof(float),
+                 GDRAM2NRAM);
 
+        // multiply
+        __bang_mul(bufM, bufA, bufB, alen);
 
-        /*-------------------------
-          6. 搬运 B[k:k+len]
-        -------------------------*/
-        __memcpy(
-            nram_B,
-            B + offset,
-            len * sizeof(float),
-            GDRAM2NRAM);
-
-
-        /*-------------------------
-          7. 元素级乘法
-        -------------------------*/
-        __bang_mul(
-            nram_mul,
-            nram_A,
-            nram_B,
-            aligned_len);
-
-
-        /*-------------------------
-          8. NRAM 内标量规约
-        -------------------------*/
+        // reduction
         for (uint32_t i = 0; i < len; ++i) {
-            acc += nram_mul[i];
+            acc += bufM[i];
         }
     }
 
-    /*-------------------------
-      9. 写回结果 C[row]
-    -------------------------*/
-    C[row_index] = acc;
+    // write result
+    C[row_idx] = acc;
 }
