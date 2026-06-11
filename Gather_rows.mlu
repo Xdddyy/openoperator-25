@@ -7,6 +7,7 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include <cn_api.h>
 #include <stdint.h>
 #include <cstdio>
 
@@ -23,9 +24,9 @@ static bool g_pinned_init = false;
 
 static void ensure_pinned(void) {
     if (g_pinned_init) return;
-    cnrtMallocHost((void**)&g_in_pinned,  BATCH * N_COL * sizeof(uint16_t));
-    cnrtMallocHost((void**)&g_idx_pinned, BATCH * K_COL * sizeof(int64_t));
-    cnrtMallocHost((void**)&g_out_pinned, BATCH * K_COL * sizeof(uint16_t));
+    cnMallocHost((void**)&g_in_pinned,  BATCH * N_COL * sizeof(uint16_t));
+    cnMallocHost((void**)&g_idx_pinned, BATCH * K_COL * sizeof(int64_t));
+    cnMallocHost((void**)&g_out_pinned, BATCH * K_COL * sizeof(uint16_t));
     g_pinned_init = true;
 }
 
