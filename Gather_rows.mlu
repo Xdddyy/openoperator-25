@@ -1,5 +1,5 @@
 // 110_Gather_rows v110_83_fused_d2h_no_fallback
-#warning "BUILD_VERSION v110_83_fused_d2h_no_fallback"
+#warning "BUILD_VERSION v110_83_fused_d2h_no_fallbacke"
 
 #include <bang.h>
 #include <torch/extension.h>
