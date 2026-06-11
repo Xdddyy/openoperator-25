@@ -1,5 +1,6 @@
-// 110_Gather_rows v110_78c_dlsym_cnMallocHost_fallback
-#warning "BUILD_VERSION v110_78c_dlsym_cnMallocHost_fallback"
+// 110_Gather_rows v110_79_ctor_prealloc_prefault
+// 基于 v76：把 host buffer 分配和触页移到 constructor，不用 cnMallocHost，不用 dlopen
+#warning "BUILD_VERSION v110_79_ctor_prealloc_prefault"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -8,90 +9,58 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
 
-#define INPUT_ELEMS  (BATCH * N_COL)
-#define INDEX_ELEMS  (BATCH * K_COL)
-#define OUTPUT_ELEMS (BATCH * K_COL)
+#define INPUT_BYTES  (BATCH * N_COL * sizeof(uint16_t))
+#define INDEX_BYTES  (BATCH * K_COL * sizeof(int64_t))
+#define OUTPUT_BYTES (BATCH * K_COL * sizeof(uint16_t))
 
 static uint16_t *g_in  = nullptr;
 static int64_t  *g_idx = nullptr;
 static uint16_t *g_out = nullptr;
 
-typedef int (*cnMallocHost_fn_t)(void **, unsigned long long);
-
-static void *try_pinned_alloc(size_t bytes, const char *name) {
-    static cnMallocHost_fn_t fn = nullptr;
-    static int tried = 0;
-
-    if (!tried) {
-        tried = 1;
-
-        const char *libs[] = {
-            "libcn_api.so",
-            "/usr/local/neuware/lib64/libcn_api.so",
-            "libcnrt.so",
-            "/usr/local/neuware/lib64/libcnrt.so",
-            nullptr
-        };
-
-        for (int i = 0; libs[i] != nullptr && fn == nullptr; ++i) {
-            void *h = dlopen(libs[i], RTLD_LAZY | RTLD_LOCAL);
-            if (h) {
-                fn = (cnMallocHost_fn_t)dlsym(h, "cnMallocHost");
-                fprintf(stderr,
-                        "[V78C_DLSYM] lib=%s handle=%p fn=%p\n",
-                        libs[i], h, (void*)fn);
-                fflush(stderr);
-            }
-        }
-    }
-
-    void *p = nullptr;
-
-    if (fn) {
-        int ret = fn(&p, (unsigned long long)bytes);
-        fprintf(stderr,
-                "[V78C_ALLOC] %s pinned bytes=%zu ret=%d ptr=%p\n",
-                name, bytes, ret, p);
-        fflush(stderr);
-
-        if (ret == 0 && p != nullptr) {
-            return p;
-        }
-    }
-
-    // fallback：不让版本因为 pinned 不可用而挂掉
-    int r = posix_memalign(&p, 4096, bytes);
-    fprintf(stderr,
-            "[V78C_ALLOC] %s fallback posix bytes=%zu ret=%d ptr=%p\n",
-            name, bytes, r, p);
-    fflush(stderr);
-
-    return p;
-}
-
-static void ensure_buf(void) {
+static void alloc_and_touch_host_buffers(void) {
     if (g_in) return;
 
-    g_in  = (uint16_t*)try_pinned_alloc(INPUT_ELEMS * sizeof(uint16_t), "input");
-    g_idx = (int64_t*) try_pinned_alloc(INDEX_ELEMS * sizeof(int64_t),  "index");
-    g_out = (uint16_t*)try_pinned_alloc(OUTPUT_ELEMS * sizeof(uint16_t), "output");
+    int r0 = posix_memalign((void**)&g_in,  4096, INPUT_BYTES);
+    int r1 = posix_memalign((void**)&g_idx, 4096, INDEX_BYTES);
+    int r2 = posix_memalign((void**)&g_out, 4096, OUTPUT_BYTES);
+
+    if (r0 == 0 && g_in)  memset(g_in,  0, INPUT_BYTES);
+    if (r1 == 0 && g_idx) memset(g_idx, 0, INDEX_BYTES);
+    if (r2 == 0 && g_out) memset(g_out, 0, OUTPUT_BYTES);
+
+    fprintf(stderr,
+            "[V79_CTOR_ALLOC] r=%d,%d,%d ptr=%p,%p,%p bytes=%d,%d,%d\n",
+            r0, r1, r2,
+            (void*)g_in, (void*)g_idx, (void*)g_out,
+            (int)INPUT_BYTES, (int)INDEX_BYTES, (int)OUTPUT_BYTES);
+    fflush(stderr);
 }
 
-static inline void cpu_gather_half(void) {
-    for (int b = 0; b < BATCH; ++b) {
-        const uint16_t *in_row = g_in + b * N_COL;
-        const int64_t  *idx_row = g_idx + b * K_COL;
-        uint16_t *out_row = g_out + b * K_COL;
+__attribute__((constructor))
+static void module_ctor_prealloc(void) {
+    alloc_and_touch_host_buffers();
+}
 
-        #pragma GCC unroll 32
-        for (int k = 0; k < K_COL; ++k) {
-            out_row[k] = in_row[(int)idx_row[k]];
+static inline void ensure_aligned(void) {
+    if (!g_in || !g_idx || !g_out) {
+        alloc_and_touch_host_buffers();
+    }
+}
+
+static inline void gather8_interleave(
+    const uint16_t *in_base[8],
+    const int64_t  *idx_base[8],
+    uint16_t *out_base[8]
+) {
+    for (int k = 0; k < K_COL; ++k) {
+        #pragma GCC unroll 8
+        for (int r = 0; r < 8; ++r) {
+            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
         }
     }
 }
@@ -99,31 +68,39 @@ static inline void cpu_gather_half(void) {
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
-    ensure_buf();
+    ensure_aligned();
 
-    if (input.scalar_type() == torch::kHalf) {
-        cnrtMemcpy(g_idx,
-                   index.data_ptr<int64_t>(),
-                   INDEX_ELEMS * sizeof(int64_t),
-                   CNRT_MEM_TRANS_DIR_DEV2HOST);
+    cnrtMemcpy(g_idx,
+               index.data_ptr<int64_t>(),
+               INDEX_BYTES,
+               CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-        cnrtMemcpy(g_in,
-                   input.data_ptr(),
-                   INPUT_ELEMS * sizeof(uint16_t),
-                   CNRT_MEM_TRANS_DIR_DEV2HOST);
+    cnrtMemcpy(g_in,
+               input.data_ptr(),
+               INPUT_BYTES,
+               CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-        cpu_gather_half();
+    for (int g = 0; g < BATCH; g += 8) {
+        const uint16_t *in_ptrs[8];
+        const int64_t  *idx_ptrs[8];
+        uint16_t *out_ptrs[8];
 
-        cnrtMemcpy(output.data_ptr(),
-                   g_out,
-                   OUTPUT_ELEMS * sizeof(uint16_t),
-                   CNRT_MEM_TRANS_DIR_HOST2DEV);
+        #pragma GCC unroll 8
+        for (int r = 0; r < 8; ++r) {
+            in_ptrs[r]  = g_in  + (g + r) * N_COL;
+            idx_ptrs[r] = g_idx + (g + r) * K_COL;
+            out_ptrs[r] = g_out + (g + r) * K_COL;
+        }
 
-    } else {
-        TORCH_CHECK(false, "v110_78c only supports half");
+        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
     }
 
-    fprintf(stderr, "[V78C] dlsym pinned fallback gather\n");
+    cnrtMemcpy(output.data_ptr(),
+               g_out,
+               OUTPUT_BYTES,
+               CNRT_MEM_TRANS_DIR_HOST2DEV);
+
+    fprintf(stderr, "[V79] ctor prealloc + prefault + row-interleave\n");
     fflush(stderr);
 
     return output;
