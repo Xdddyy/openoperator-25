@@ -1,7 +1,7 @@
 // 110_Gather_rows v110_71_aligned_memory
 // v66b 的进阶版：input/index 用 posix_memalign 分配 cache-line 对齐内存
 // 对齐的内存可以让 D2H DMA 更高效，减少 partial-write cache line
-// mlock 权限不够时 fallback 到普通分配
+// mlock 权限不够时 fallback 到普通分配1
 #warning "BUILD_VERSION v110_71_aligned_memory"
 
 #include <bang.h>
