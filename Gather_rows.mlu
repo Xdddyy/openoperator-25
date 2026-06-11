@@ -1,42 +1,35 @@
-// 110_Gather_rows v110_69_seq_read_gather
-// 核心思路：每行先顺序读 2KB 到局部 buffer，再用 index 查 L1/寄存器
-// 32 次随机加载(input) → 1 次顺序 DMA(2KB) + 32 次 L1 随机访问
-// 额外开销：每行多读 2KB（但顺序读比随机读快 5-10x）
-#warning "BUILD_VERSION v110_69_seq_read_gather"
+// 110_Gather_rows v110_73_align_optimize
+// v71 的精简版：去掉 v71 的 ensure_aligned 分支，用 static aligned 数组
+// g_in/g_idx/g_out 全部用 __attribute__((aligned(4096))) 强制对齐
+// 核心优化: 4KB 页对齐让 DMA burst 更长，减少 transaction 数量
+#warning "BUILD_VERSION v110_73_align_optimize"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
 #include <cstdio>
-#include <string.h>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
 
-static uint16_t g_in[BATCH * N_COL];
-static  int64_t g_idx[BATCH * K_COL];
-static uint16_t g_out[BATCH * K_COL];
+// 4KB页对齐的静态缓冲区（比 posix_memalign 少一次 malloc 开销）
+static alignas(4096) uint16_t g_in[BATCH * N_COL];
+static alignas(4096)  int64_t g_idx[BATCH * K_COL];
+static alignas(4096) uint16_t g_out[BATCH * K_COL];
 
-// 每行局部 buffer: 2KB = 1024 half
-// 放在 .bss 区，不压栈
-static uint16_t g_rowbuf[BATCH * N_COL];
-
-// gather 一行: 先顺序读入 g_rowbuf，再用 index 查
-static inline void gather_row_seq(
-    const uint16_t * in_base,
-    const  int64_t * idx,
-    uint16_t * out
+// Row-interleaved gather (same as v66b)
+static inline void gather8_interleave(
+    const uint16_t * in_base[8],
+    const  int64_t * idx_base[8],
+    uint16_t * out_base[8]
 ) {
-    // 顺序读 2KB (这一行) 到 rowbuf
-    // memcpy 使用 SIMD (SSE/AVX) 优化
-    // memcpy 会被编译器翻译成 SIMD 指令
-    ::memcpy(g_rowbuf, in_base, N_COL * sizeof(uint16_t));
-
-    // 现在 gather: 32 次随机加载全在 rowbuf 里（L1 cache hot）
     for (int k = 0; k < K_COL; ++k) {
-        out[k] = g_rowbuf[(int)idx[k]];
+        #pragma GCC unroll 8
+        for (int r = 0; r < 8; ++r) {
+            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
+        }
     }
 }
 
@@ -54,10 +47,16 @@ torch::Tensor bang_func(torch::Tensor input,
                BATCH * N_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    for (int b = 0; b < BATCH; ++b) {
-        gather_row_seq(g_in + b * N_COL,
-                       g_idx + b * K_COL,
-                       g_out + b * K_COL);
+    for (int g = 0; g < BATCH; g += 8) {
+        const uint16_t *in_ptrs[8];
+        const  int64_t *idx_ptrs[8];
+        uint16_t *out_ptrs[8];
+        for (int r = 0; r < 8; ++r) {
+            in_ptrs[r]  = g_in  + (g + r) * N_COL;
+            idx_ptrs[r] = g_idx + (g + r) * K_COL;
+            out_ptrs[r] = g_out + (g + r) * K_COL;
+        }
+        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
     }
 
     cnrtMemcpy(output.data_ptr(),
@@ -65,7 +64,7 @@ torch::Tensor bang_func(torch::Tensor input,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V69] seq-read gather\n");
+    fprintf(stderr, "[V73] alignas(4096) static\n");
     fflush(stderr);
 
     return output;
