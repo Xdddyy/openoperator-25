@@ -1,12 +1,10 @@
-// 110_Gather_rows v110_79_ctor_prealloc_prefault
-// 基于 v76：把 host buffer 分配和触页移到 constructor，不用 cnMallocHost，不用 dlopen
-#warning "BUILD_VERSION v110_79_ctor_prealloc_prefault"
+// 110_Gather_rows v110_79_no_print_ctor_prealloc_prefault
+#warning "BUILD_VERSION v110_79_no_print_ctor_prealloc_prefault"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -25,20 +23,14 @@ static uint16_t *g_out = nullptr;
 static void alloc_and_touch_host_buffers(void) {
     if (g_in) return;
 
-    int r0 = posix_memalign((void**)&g_in,  4096, INPUT_BYTES);
-    int r1 = posix_memalign((void**)&g_idx, 4096, INDEX_BYTES);
-    int r2 = posix_memalign((void**)&g_out, 4096, OUTPUT_BYTES);
+    posix_memalign((void**)&g_in,  4096, INPUT_BYTES);
+    posix_memalign((void**)&g_idx, 4096, INDEX_BYTES);
+    posix_memalign((void**)&g_out, 4096, OUTPUT_BYTES);
 
-    if (r0 == 0 && g_in)  memset(g_in,  0, INPUT_BYTES);
-    if (r1 == 0 && g_idx) memset(g_idx, 0, INDEX_BYTES);
-    if (r2 == 0 && g_out) memset(g_out, 0, OUTPUT_BYTES);
-
-    fprintf(stderr,
-            "[V79_CTOR_ALLOC] r=%d,%d,%d ptr=%p,%p,%p bytes=%d,%d,%d\n",
-            r0, r1, r2,
-            (void*)g_in, (void*)g_idx, (void*)g_out,
-            (int)INPUT_BYTES, (int)INDEX_BYTES, (int)OUTPUT_BYTES);
-    fflush(stderr);
+    // prefault：把缺页、首次触页成本挪到 module load 阶段
+    if (g_in)  memset(g_in,  0, INPUT_BYTES);
+    if (g_idx) memset(g_idx, 0, INDEX_BYTES);
+    if (g_out) memset(g_out, 0, OUTPUT_BYTES);
 }
 
 __attribute__((constructor))
@@ -53,9 +45,9 @@ static inline void ensure_aligned(void) {
 }
 
 static inline void gather8_interleave(
-    const uint16_t *in_base[8],
-    const int64_t  *idx_base[8],
-    uint16_t *out_base[8]
+    const uint16_t * __restrict__ in_base[8],
+    const int64_t  * __restrict__ idx_base[8],
+    uint16_t       * __restrict__ out_base[8]
 ) {
     for (int k = 0; k < K_COL; ++k) {
         #pragma GCC unroll 8
@@ -99,9 +91,6 @@ torch::Tensor bang_func(torch::Tensor input,
                g_out,
                OUTPUT_BYTES,
                CNRT_MEM_TRANS_DIR_HOST2DEV);
-
-    fprintf(stderr, "[V79] ctor prealloc + prefault + row-interleave\n");
-    fflush(stderr);
 
     return output;
 }
