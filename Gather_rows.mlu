@@ -24,7 +24,7 @@ static inline void touch_pages(uint8_t *p, size_t bytes) {
     if (!p) return;
 
     // 轻量 prefault：每 4096B 触一下，避免完整 memset 的 module-load 成本过大。
-    // 这部分理论上不计入 bangc_us，但保留触页更稳。
+    // 这部分理论上不计入 bangc_us，但保留触页更稳a。
     for (size_t off = 0; off < bytes; off += 4096) {
         p[off] = 0;
     }
