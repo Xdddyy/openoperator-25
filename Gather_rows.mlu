@@ -1,7 +1,8 @@
-// 110_Gather_rows v110_78_minimal_d2h_v2
-// 修复：__nram__ 只修饰局部数组，不能修饰 kernel 参数
-// 只 D2H index（16KB），MLU kernel 从 GDRAM 直接 gather
-#warning "BUILD_VERSION v110_78_minimal_d2h_v2"
+// 110_Gather_rows v110_76_posix_align_opt
+// v71 的精准复现（117.8us，最佳版本）
+// posix_memalign 4KB 对齐 + row-interleaved gather
+// 去掉 v74 的 queue 并行（实测无效，D2H 本身串行）
+#warning "BUILD_VERSION v110_76_posix_align_opt"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -13,72 +14,65 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define TOTAL_K  2048  // BATCH*K_COL
 
-static int64_t *g_idx;
-static bool g_init = false;
+static uint16_t *g_in;
+static  int64_t *g_idx;
+static uint16_t *g_out;
 
-static void ensure_init(void) {
-    if (g_init) return;
-    if (posix_memalign((void**)&g_idx, 4096, BATCH * K_COL * sizeof(int64_t)) != 0) g_idx = nullptr;
-    g_init = true;
-}
-
-__mlu_entry__ void gather_kernel(
-    const uint16_t *input,  // GDRAM — 不能加 __nram__
-    const  int64_t *idx,   // host-copied g_idx, read as GDRAM pointer in kernel
-    uint16_t *output       // GDRAM — 不能加 __nram__
+static inline void gather8_interleave(
+    const uint16_t * in_base[8],
+    const  int64_t * idx_base[8],
+    uint16_t * out_base[8]
 ) {
-    if (taskId != 0) return;
-
-    // NRAM 局部缓冲区
-    __nram__ unsigned short off[TOTAL_K];
-    __nram__ uint16_t nram_out[TOTAL_K];
-
-    // Build offset table: for row b, col k -> element offset = b*N_COL + idx[b*K_COL+k]
-    for (int b = 0; b < BATCH; ++b) {
-        int base = b * K_COL;
-        int row  = b * N_COL;
-        for (int k = 0; k < K_COL; ++k) {
-            off[base + k] = (unsigned short)(row + (int)idx[base + k]);
+    for (int k = 0; k < K_COL; ++k) {
+        #pragma GCC unroll 8
+        for (int r = 0; r < 8; ++r) {
+            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
         }
     }
+}
 
-    // __gather: src=GDRAM input (via offset), dst=NRAM nram_out
-    __gather(nram_out,
-             input,
-             off,
-             2,           // elem_size=2 (half)
-             NRAM2NRAM,
-             GDRAM2NRAM,
-             TOTAL_K);
-
-    // NRAM → GDRAM output
-    __memcpy(output, nram_out, TOTAL_K * 2, NRAM2GDRAM);
+static void ensure_aligned(void) {
+    if (g_in) return;
+    // 4KB 页对齐 — 与 v71 完全一致
+    if (posix_memalign((void**)&g_in,  4096, BATCH * N_COL * sizeof(uint16_t)) != 0) g_in  = nullptr;
+    if (posix_memalign((void**)&g_idx, 4096, BATCH * K_COL * sizeof(int64_t)) != 0) g_idx = nullptr;
+    if (posix_memalign((void**)&g_out, 4096, BATCH * K_COL * sizeof(uint16_t)) != 0) g_out = nullptr;
 }
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
-    ensure_init();
+    ensure_aligned();
 
-    // Only D2H index (16KB) — no input D2H
     cnrtMemcpy(g_idx,
                index.data_ptr<int64_t>(),
                BATCH * K_COL * sizeof(int64_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtMemcpy(g_in,
+               input.data_ptr(),
+               BATCH * N_COL * sizeof(uint16_t),
+               CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    gather_kernel<<<dim, ktype, queue>>>(
-        (const uint16_t*)input.data_ptr(),
-        g_idx,
-        (uint16_t*)output.data_ptr()
-    );
+    for (int g = 0; g < BATCH; g += 8) {
+        const uint16_t *in_ptrs[8];
+        const  int64_t *idx_ptrs[8];
+        uint16_t *out_ptrs[8];
+        for (int r = 0; r < 8; ++r) {
+            in_ptrs[r]  = g_in  + (g + r) * N_COL;
+            idx_ptrs[r] = g_idx + (g + r) * K_COL;
+            out_ptrs[r] = g_out + (g + r) * K_COL;
+        }
+        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
+    }
 
-    fprintf(stderr, "[V78] minimal D2H, MLU gather from GDRAM\n");
+    cnrtMemcpy(output.data_ptr(),
+               g_out,
+               BATCH * K_COL * sizeof(uint16_t),
+               CNRT_MEM_TRANS_DIR_HOST2DEV);
+
+    fprintf(stderr, "[V76] posix_memalign + row-interleave\n");
     fflush(stderr);
 
     return output;
