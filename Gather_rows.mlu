@@ -1,85 +1,81 @@
-// 110_Gather_rows v110_91_bang_gather
-// 改用 __bang_gather: __gather 在 compute_30 上 direction 全不支持
-// 改用 v93 方案: idx 先 __memcpy 到 NRAM，再 __bang_gather
-#warning "BUILD_VERSION v110_91_bang_gather"
+// 110_Gather_rows v110_78_pinned_host_gather
+#warning "BUILD_VERSION v110_78_pinned_host_gather"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
 #include <cstdio>
-#include <stdlib.h>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define TOTAL_K (BATCH * K_COL)
 
-static int64_t *g_idx;
-static bool g_init = false;
+static uint16_t *g_in = nullptr;
+static int64_t  *g_idx = nullptr;
+static uint16_t *g_out = nullptr;
 
-static void ensure_init(void) {
-    if (g_init) return;
-    if (posix_memalign((void**)&g_idx, 4096, BATCH * K_COL * sizeof(int64_t)) != 0) g_idx = nullptr;
-    g_init = true;
-}
-
-__mlu_entry__ void gather_kernel(
-    const uint16_t *input,
-    const  int64_t *idx,
-    uint16_t *output
+static inline void gather8_interleave(
+    const uint16_t *in_base[8],
+    const int64_t  *idx_base[8],
+    uint16_t *out_base[8]
 ) {
-    if (taskId != 0) return;
-
-    __nram__ unsigned short off[TOTAL_K];
-    __nram__ uint16_t nram_out[TOTAL_K];
-    __nram__ int64_t nram_idx[TOTAL_K];
-
-    // idx 从 GDRAM 拷到 NRAM（避免 unified addressing 问题）
-    __memcpy(nram_idx, idx, TOTAL_K * 8, GDRAM2NRAM);
-
-    // 构建元素偏移量
-    for (int b = 0; b < BATCH; ++b) {
-        int base = b * K_COL;
-        int row  = b * N_COL;
-        for (int k = 0; k < K_COL; ++k) {
-            off[base + k] = (unsigned short)(row + (int)nram_idx[base + k]);
+    for (int k = 0; k < K_COL; ++k) {
+        #pragma GCC unroll 8
+        for (int r = 0; r < 8; ++r) {
+            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
         }
     }
+}
 
-    // __bang_gather: GDRAM -> NRAM
-    __bang_gather(nram_out, input, (int16_t*)off, TOTAL_K, 2, 1, 1);
+static void ensure_buf(void) {
+    if (g_in) return;
 
-    // NRAM -> GDRAM
-    __memcpy(output, nram_out, TOTAL_K * 2, NRAM2GDRAM);
+    cnrtMallocHost((void**)&g_in,
+                   BATCH * N_COL * sizeof(uint16_t));
+
+    cnrtMallocHost((void**)&g_idx,
+                   BATCH * K_COL * sizeof(int64_t));
+
+    cnrtMallocHost((void**)&g_out,
+                   BATCH * K_COL * sizeof(uint16_t));
 }
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
-    ensure_init();
+    ensure_buf();
 
     cnrtMemcpy(g_idx,
                index.data_ptr<int64_t>(),
                BATCH * K_COL * sizeof(int64_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    auto input_cont  = input.contiguous();
-    auto output_cont = output.contiguous();
+    cnrtMemcpy(g_in,
+               input.data_ptr(),
+               BATCH * N_COL * sizeof(uint16_t),
+               CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    for (int g = 0; g < BATCH; g += 8) {
+        const uint16_t *in_ptrs[8];
+        const int64_t  *idx_ptrs[8];
+        uint16_t *out_ptrs[8];
 
-    gather_kernel<<<dim, ktype, queue>>>(
-        (const uint16_t*)input_cont.data_ptr(),
-        g_idx,
-        (uint16_t*)output_cont.data_ptr()
-    );
+        for (int r = 0; r < 8; ++r) {
+            in_ptrs[r]  = g_in  + (g + r) * N_COL;
+            idx_ptrs[r] = g_idx + (g + r) * K_COL;
+            out_ptrs[r] = g_out + (g + r) * K_COL;
+        }
 
-    cnrtQueueSync(queue);
+        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
+    }
 
-    fprintf(stderr, "[V91] __bang_gather, idx->NRAM\n");
+    cnrtMemcpy(output.data_ptr(),
+               g_out,
+               BATCH * K_COL * sizeof(uint16_t),
+               CNRT_MEM_TRANS_DIR_HOST2DEV);
+
+    fprintf(stderr, "[V78] pinned host gather\n");
     fflush(stderr);
 
     return output;
