@@ -11,8 +11,10 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
+    // 为方便调试，暂时单核执行，避免多核划分错误导致的越界
+    uint32_t core_id = 0;   // 固定为第0核
+    uint32_t core_num = 1;  // 只用1核
+
     uint32_t per_core = M / core_num;
     uint32_t remainder = M % core_num;
 
@@ -28,12 +30,12 @@ __mlu_entry__ void gemv_kernel(
 
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
+
         __bang_write_zero(nram_sum, 1);
 
         for (uint32_t k = 0; k < K; k += CHUNK_SIZE) {
             uint32_t len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
 
-            // 只初始化有效长度部分
             __bang_write_zero(nram_b, len);
             __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
@@ -42,7 +44,7 @@ __mlu_entry__ void gemv_kernel(
 
             __bang_mul(nram_mul, nram_a, nram_b, len);
 
-            // 简单for累加，避免复杂归约逻辑导致偏差
+            // 简单for累加，避免折半归约逻辑复杂产生错误
             float sum = 0.f;
             for (uint32_t idx = 0; idx < len; ++idx) {
                 sum += nram_mul[idx];
@@ -85,7 +87,7 @@ torch::Tensor bang_func(
     auto C_fp32 = torch::empty({M, 1}, A_fp32.options());
 
     cnrtQueue_t queue = nullptr;
-    cnrtDim3_t dim = {4, 1, 1};
+    cnrtDim3_t dim = {1, 1, 1};  // 单核测试先
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
     gemv_kernel<<<dim, ktype, queue>>>(
