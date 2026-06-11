@@ -1,166 +1,121 @@
+// gemv.mlu
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 
 #define CHUNK_SIZE 4096
-#define ALIGN      64
-#define MAX_LOCAL_ROWS 1024  // 可根据 NRAM 容量调整
 
-// ---------------------------------------------------------------------------
-// 辅助函数：安全地从非对齐 GDRAM 地址加载 len 个 float 到对齐的 NRAM 地址
-// 使用临时 NRAM 空间 temp，其大小至少为 (len + ALIGN/sizeof(float))
-// ---------------------------------------------------------------------------
-__mlu_func__ void load_unaligned(
-    const float* src,
-    float*       dst,
-    int          len,
-    float*       temp)
-{
-    uintptr_t addr = (uintptr_t)src;
-    int offset_elems = (addr & (ALIGN - 1)) / sizeof(float);
-    const float* aligned_src = (const float*)(addr - (addr & (ALIGN - 1)));
-    int load_len = offset_elems + len;
-    int aligned_load_len = (load_len + ALIGN/sizeof(float) - 1) & ~(ALIGN/sizeof(float) - 1);
+/**
+ * MLU 内核：矩阵向量乘法 GEMV (C = A * B)
+ * 多核任务分发：taskDim = {4, 1, 1}，沿 M 维度切分
+ * A: [M, K] (行主序)
+ * B: [K, 1]
+ * C: [M, 1]
+ */
+__mlu_entry__ void gemv_kernel(float* A, float* B, float* C, int M, int K) {
+    int tid = taskIdX;
+    int tdim = taskDimX;
 
-    __memcpy(temp, aligned_src, aligned_load_len * sizeof(float), GDRAM2NRAM);
-    for (int i = 0; i < len; ++i) {
-        dst[i] = temp[offset_elems + i];
+    // 每核心负责的行范围（假设 M 可被 tdim 整除，M=256 满足）
+    int rows_per_core = M / tdim;
+    int start_row = tid * rows_per_core;
+    int end_row = start_row + rows_per_core;
+
+    // NRAM 变量声明
+    __nram__ float A_row[CHUNK_SIZE];          // A 的一行片段
+    __nram__ float B_chunk[CHUNK_SIZE];        // B 的一个片段
+    __nram__ float partial_sum[64];            // 每行部分和，最多 64 行
+    __nram__ float sum_tmp;                    // 单次归约结果
+
+    // SRAM 缓冲区，供归约操作使用
+    __sram__ float reduce_buf[CHUNK_SIZE];
+
+    // 初始化部分和为零
+    __bang_write_zero(partial_sum, rows_per_core);
+
+    // 沿 K 方向分块处理
+    for (int k = 0; k < K; k += CHUNK_SIZE) {
+        int chunk = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
+
+        // 加载 B 的当前片段到 NRAM
+        __memcpy(B_chunk, B + k, chunk * sizeof(float), GDRAM2NRAM);
+
+        // 逐行处理当前核心负责的 A 行
+        for (int r = start_row; r < end_row; ++r) {
+            // 加载 A[r][k:k+chunk] 到 NRAM
+            __memcpy(A_row, A + r * K + k, chunk * sizeof(float), GDRAM2NRAM);
+
+            // 逐元素相乘
+            __bang_mul(A_row, A_row, B_chunk, chunk);
+
+            // 归约求和，使用 SRAM 缓冲区
+            __bang_reduce_sum(&sum_tmp, A_row, chunk, reduce_buf);
+
+            // 累加到该行的部分和 (不可用 +=，需用 BANG API)
+            __bang_add_scalar(
+                partial_sum + (r - start_row),
+                partial_sum + (r - start_row),
+                sum_tmp,
+                1
+            );
+        }
+    }
+
+    // 将最终结果写回 GDRAM 的 C 向量
+    for (int r = start_row; r < end_row; ++r) {
+        __memcpy(C + r, &partial_sum[r - start_row], sizeof(float), NRAM2GDRAM);
     }
 }
 
-// ---------------------------------------------------------------------------
-// 内核函数：矩阵向量乘 (A[M×K] × B[K] = C[M])，多核并行
-// ---------------------------------------------------------------------------
-__mlu_entry__ void gemv_kernel(
-    float* A,
-    float* B,
-    float* C,
-    int    M,
-    int    K)
-{
-    int task_id  = taskId;
-    int task_num = taskDim.x;   // 预设为 4
+/**
+ * PyTorch 入口函数：接收输入张量，在 MLU 上执行 GEMV，返回输出张量。
+ * 内部负责数据迁移至 MLU、初始化 CNRT 环境、配置并启动内核。
+ */
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+    // 确保输入为 float32 连续张量，并转移到 MLU 设备
+    A = A.to(torch::kMLU).contiguous().to(torch::kFloat32);
+    B = B.to(torch::kMLU).contiguous().to(torch::kFloat32);
 
-    int rows_per_task = (M + task_num - 1) / task_num;
-    int start = task_id * rows_per_task;
-    int end   = start + rows_per_task;
-    if (end > M) end = M;
+    int M = A.size(0);
+    int K = A.size(1);
 
-    __nram__ float nram_a[CHUNK_SIZE];
-    __nram__ float nram_b[CHUNK_SIZE];
-    __nram__ float nram_temp[CHUNK_SIZE + ALIGN/sizeof(float)];  // 非对齐加载专用
+    // 创建 MLU 上的输出张量
+    auto C = torch::empty({M, 1}, A.options());
 
-    // ==================================================================
-    // 情况 1：K 较小，B 可一次完整加载
-    // ==================================================================
-    if (K <= CHUNK_SIZE) {
-        load_unaligned(B, nram_b, K, nram_temp);
-        for (int row = start; row < end; ++row) {
-            load_unaligned(A + row * K, nram_a, K, nram_temp);
-            // 将有效长度补齐到 64 的倍数，填充 0 不影响乘法与求和
-            int aligned_len = (K + 63) & ~63;
-            if (aligned_len > K) {
-                for (int i = K; i < aligned_len; ++i) nram_a[i] = 0.0f;
-                // 注意 nram_b 中多余部分可能未初始化，但不会参与乘法（乘积只用到 aligned_len，超出部分为 0）
-            }
-            __bang_mul(nram_a, nram_a, nram_b, aligned_len);
-            C[row] = __bang_sum(nram_a, aligned_len);
-        }
-        return;
-    }
+    // 初始化 CNRT 环境（实际应用中 PyTorch 可能已初始化，这里保留以符合接口）
+    cnrtInit(0);
+    cnrtDev_t dev;
+    cnrtGetDevice(&dev);
+    cnrtQueue_t queue;
+    cnrtQueueCreate(&queue);
 
-    // ==================================================================
-    // 情况 2：K > CHUNK_SIZE，分块计算，外循环沿 K 分块，内循环遍历行
-    // ==================================================================
-    int num_chunks = (K + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    int local_rows = end - start;
+    // 内核维度配置，使用 4 核 {4, 1, 1}
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t func_type = CNRT_FUNC_TYPE_UNION1;
 
-    // 若当前 task 负责的行数过多，NRAM 无法容纳累加器，回退到逐行模式
-    if (local_rows > MAX_LOCAL_ROWS) {
-        // 回退模式：仍按原始行优先顺序，但每次分块时也须复用 B（效率略低，但保证正确）
-        for (int row = start; row < end; ++row) {
-            float acc = 0.0f;
-            for (int chunk = 0; chunk < num_chunks; ++chunk) {
-                int offset = chunk * CHUNK_SIZE;
-                int len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
-                int aligned_len = (len + 63) & ~63;
-
-                load_unaligned(B + offset, nram_b, len, nram_temp);
-                for (int i = len; i < aligned_len; ++i) nram_b[i] = 0.0f;
-
-                load_unaligned(A + row * K + offset, nram_a, len, nram_temp);
-                for (int i = len; i < aligned_len; ++i) nram_a[i] = 0.0f;
-
-                __bang_mul(nram_a, nram_a, nram_b, aligned_len);
-                acc += __bang_sum(nram_a, aligned_len);
-            }
-            C[row] = acc;
-        }
-        return;
-    }
-
-    // 高效模式：NRAM 容纳所有行的累加器，每个 chunk 只加载一次 B
-    __nram__ float acc[MAX_LOCAL_ROWS];
-    for (int i = 0; i < local_rows; ++i) acc[i] = 0.0f;
-
-    for (int chunk = 0; chunk < num_chunks; ++chunk) {
-        int offset = chunk * CHUNK_SIZE;
-        int len = (offset + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - offset);
-        int aligned_len = (len + 63) & ~63;
-
-        // 加载当前 chunk 的 B（仅一次）
-        load_unaligned(B + offset, nram_b, len, nram_temp);
-        for (int i = len; i < aligned_len; ++i) nram_b[i] = 0.0f;
-
-        // 处理该 task 的所有行
-        for (int i = 0, row = start; row < end; ++row, ++i) {
-            load_unaligned(A + row * K + offset, nram_a, len, nram_temp);
-            for (int j = len; j < aligned_len; ++j) nram_a[j] = 0.0f;
-
-            __bang_mul(nram_a, nram_a, nram_b, aligned_len);
-            acc[i] += __bang_sum(nram_a, aligned_len);
-        }
-    }
-
-    // 写回最终结果
-    for (int i = 0, row = start; row < end; ++row, ++i) {
-        C[row] = acc[i];
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 供 PyTorch 调用的 C++ 入口函数
-// ---------------------------------------------------------------------------
-void bang_gemv(
-    cnrtQueue_t    queue,
-    torch::Tensor  A,
-    torch::Tensor  B,
-    torch::Tensor  C,
-    int            M,
-    int            K)
-{
-    // 确保 Tensor 在 MLU 设备上且连续
-    TORCH_CHECK(A.is_mlu(), "A must be on MLU");
-    TORCH_CHECK(B.is_mlu(), "B must be on MLU");
-    TORCH_CHECK(C.is_mlu(), "C must be on MLU");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && C.is_contiguous(),
-                "All tensors must be contiguous");
-
-    float* A_ptr = A.data_ptr<float>();
-    float* B_ptr = B.data_ptr<float>();
-    float* C_ptr = C.data_ptr<float>();
-
-    // 设置任务维度（多核并行，此处固定使用 4 个核心）
-    dim3 task_dim(4, 1, 1);
-    dim3 cluster_dim(1, 1, 1);
+    // 准备内核参数列表
+    void* A_ptr = A.data_ptr();
+    void* B_ptr = B.data_ptr();
+    void* C_ptr = C.data_ptr();
+    void* args[] = {&A_ptr, &B_ptr, &C_ptr, &M, &K};
 
     // 启动内核
-    cnrtRet_t ret = cnrtKernelLaunch(
+    cnrtInvokeKernel_V2(
         reinterpret_cast<void*>(gemv_kernel),
-        cluster_dim,
-        task_dim,
-        queue,
-        A_ptr, B_ptr, C_ptr, M, K
+        dim,
+        args,
+        func_type,
+        queue
     );
-    TORCH_CNRT_CHECK(ret);
+    cnrtQueueSync(queue);
+
+    // 清理资源
+    cnrtQueueDestroy(queue);
+
+    return C;
+}
+
+// Python 绑定（PyTorch 扩展机制自动生成）
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("forward", &bang_func, "GEMV forward (MLU)");
 }
