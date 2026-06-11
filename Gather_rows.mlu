@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_63a_half_no_always_inline
-// 基于 v110_62, 去掉了 __attribute__((always_inline))
-// 保留 __restrict__
-#warning "BUILD_VERSION v110_63a_half_no_always_inline"
+// 110_Gather_rows v110_63b_half_clean_inline
+// 基于 v110_62, 去掉了 __attribute__((always_inline)) 和 __restrict__
+// 干净 inline
+#warning "BUILD_VERSION v110_63b_half_clean_inline"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -23,9 +23,9 @@ static int64_t g_idx[BATCH * K_COL];
 static uint16_t g_out[BATCH * K_COL];
 
 static inline void gather_row(
-    const uint16_t * __restrict__ in_row,
-    const int64_t * __restrict__ idx_row,
-    uint16_t * __restrict__ out_row
+    const uint16_t * in_row,
+    const int64_t * idx_row,
+    uint16_t * out_row
 ) {
     for (int k = 0; k < K_COL; ++k) {
         out_row[k] = in_row[(int)idx_row[k]];
@@ -61,7 +61,7 @@ torch::Tensor bang_func(torch::Tensor input,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V63A] no always_inline\n");
+    fprintf(stderr, "[V63B] clean inline\n");
     fflush(stderr);
 
     return output;
