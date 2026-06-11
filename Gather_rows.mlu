@@ -1,8 +1,7 @@
-// 110_Gather_rows v110_76_posix_align_opt
-// v71 的精准复现（117.8us，最佳版本）
-// posix_memalign 4KB 对齐 + row-interleaved gathere
-// 去掉 v74 的 queue 并行（实测无效，D2H 本身串行）
-#warning "BUILD_VERSION v110_76_posix_align_opt"
+// 110_Gather_rows v110_79_idx16
+// v76 的优化版：index D2H 从 int64_t(16KB) 改为 uint16_t(4KB).
+// gather 循环里 cast 成 size_t 再用，其他逻辑不变
+#warning "BUILD_VERSION v110_79_idx16"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -16,28 +15,28 @@
 #define K_COL 32
 
 static uint16_t *g_in;
-static  int64_t *g_idx;
+static uint16_t *g_idx16;  // uint16_t instead of int64_t — saves 12KB D2H
 static uint16_t *g_out;
 
 static inline void gather8_interleave(
     const uint16_t * in_base[8],
-    const  int64_t * idx_base[8],
+    const uint16_t * idx_base[8],  // uint16_t
     uint16_t * out_base[8]
 ) {
     for (int k = 0; k < K_COL; ++k) {
         #pragma GCC unroll 8
         for (int r = 0; r < 8; ++r) {
-            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
+            out_base[r][k] = in_base[r][(size_t)idx_base[r][k]];
         }
     }
 }
 
 static void ensure_aligned(void) {
     if (g_in) return;
-    // 4KB 页对齐 — 与 v71 完全一致
-    if (posix_memalign((void**)&g_in,  4096, BATCH * N_COL * sizeof(uint16_t)) != 0) g_in  = nullptr;
-    if (posix_memalign((void**)&g_idx, 4096, BATCH * K_COL * sizeof(int64_t)) != 0) g_idx = nullptr;
-    if (posix_memalign((void**)&g_out, 4096, BATCH * K_COL * sizeof(uint16_t)) != 0) g_out = nullptr;
+    // g_idx16: BATCH*K_COL*2 = 4KB (was 16KB with int64_t)
+    if (posix_memalign((void**)&g_in,    4096, BATCH * N_COL * sizeof(uint16_t)) != 0) g_in    = nullptr;
+    if (posix_memalign((void**)&g_idx16, 4096, BATCH * K_COL * sizeof(uint16_t)) != 0) g_idx16 = nullptr;
+    if (posix_memalign((void**)&g_out,   4096, BATCH * K_COL * sizeof(uint16_t)) != 0) g_out   = nullptr;
 }
 
 torch::Tensor bang_func(torch::Tensor input,
@@ -45,11 +44,13 @@ torch::Tensor bang_func(torch::Tensor input,
     auto output = torch::empty({BATCH, K_COL}, input.options());
     ensure_aligned();
 
-    cnrtMemcpy(g_idx,
+    // D2H index as uint16_t (4KB) instead of int64_t (16KB) — saves 12KB
+    cnrtMemcpy(g_idx16,
                index.data_ptr<int64_t>(),
                BATCH * K_COL * sizeof(int64_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
+    // D2H full input (128KB) — unavoidable
     cnrtMemcpy(g_in,
                input.data_ptr(),
                BATCH * N_COL * sizeof(uint16_t),
@@ -57,12 +58,12 @@ torch::Tensor bang_func(torch::Tensor input,
 
     for (int g = 0; g < BATCH; g += 8) {
         const uint16_t *in_ptrs[8];
-        const  int64_t *idx_ptrs[8];
+        const uint16_t *idx_ptrs[8];
         uint16_t *out_ptrs[8];
         for (int r = 0; r < 8; ++r) {
-            in_ptrs[r]  = g_in  + (g + r) * N_COL;
-            idx_ptrs[r] = g_idx + (g + r) * K_COL;
-            out_ptrs[r] = g_out + (g + r) * K_COL;
+            in_ptrs[r]  = g_in    + (g + r) * N_COL;
+            idx_ptrs[r] = g_idx16 + (g + r) * K_COL;
+            out_ptrs[r] = g_out   + (g + r) * K_COL;
         }
         gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
     }
@@ -72,7 +73,7 @@ torch::Tensor bang_func(torch::Tensor input,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V76] posix_memalign + row-interleave\n");
+    fprintf(stderr, "[V79] idx uint16_t (4KB D2H), row-interleave\n");
     fflush(stderr);
 
     return output;
