@@ -1,12 +1,14 @@
-// 110_Gather_rows v110_78b_cnMallocHost_pinned_host_gather
-#warning "BUILD_VERSION v110_78b_cnMallocHost_pinned_host_gather"
+// 110_Gather_rows v110_78c_dlsym_cnMallocHost_fallback
+#warning "BUILD_VERSION v110_78c_dlsym_cnMallocHost_fallback"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <cn_api.h>
 #include <stdint.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
 
 #define BATCH 64
 #define N_COL 1024
@@ -20,21 +22,65 @@ static uint16_t *g_in  = nullptr;
 static int64_t  *g_idx = nullptr;
 static uint16_t *g_out = nullptr;
 
+typedef int (*cnMallocHost_fn_t)(void **, unsigned long long);
+
+static void *try_pinned_alloc(size_t bytes, const char *name) {
+    static cnMallocHost_fn_t fn = nullptr;
+    static int tried = 0;
+
+    if (!tried) {
+        tried = 1;
+
+        const char *libs[] = {
+            "libcn_api.so",
+            "/usr/local/neuware/lib64/libcn_api.so",
+            "libcnrt.so",
+            "/usr/local/neuware/lib64/libcnrt.so",
+            nullptr
+        };
+
+        for (int i = 0; libs[i] != nullptr && fn == nullptr; ++i) {
+            void *h = dlopen(libs[i], RTLD_LAZY | RTLD_LOCAL);
+            if (h) {
+                fn = (cnMallocHost_fn_t)dlsym(h, "cnMallocHost");
+                fprintf(stderr,
+                        "[V78C_DLSYM] lib=%s handle=%p fn=%p\n",
+                        libs[i], h, (void*)fn);
+                fflush(stderr);
+            }
+        }
+    }
+
+    void *p = nullptr;
+
+    if (fn) {
+        int ret = fn(&p, (unsigned long long)bytes);
+        fprintf(stderr,
+                "[V78C_ALLOC] %s pinned bytes=%zu ret=%d ptr=%p\n",
+                name, bytes, ret, p);
+        fflush(stderr);
+
+        if (ret == 0 && p != nullptr) {
+            return p;
+        }
+    }
+
+    // fallback：不让版本因为 pinned 不可用而挂掉
+    int r = posix_memalign(&p, 4096, bytes);
+    fprintf(stderr,
+            "[V78C_ALLOC] %s fallback posix bytes=%zu ret=%d ptr=%p\n",
+            name, bytes, r, p);
+    fflush(stderr);
+
+    return p;
+}
+
 static void ensure_buf(void) {
     if (g_in) return;
 
-    CNresult r0 = cnMallocHost((void**)&g_in,
-                               INPUT_ELEMS * sizeof(uint16_t));
-    CNresult r1 = cnMallocHost((void**)&g_idx,
-                               INDEX_ELEMS * sizeof(int64_t));
-    CNresult r2 = cnMallocHost((void**)&g_out,
-                               OUTPUT_ELEMS * sizeof(uint16_t));
-
-    fprintf(stderr,
-            "[V78B_ALLOC] cnMallocHost ret=%d,%d,%d ptr=%p,%p,%p\n",
-            (int)r0, (int)r1, (int)r2,
-            (void*)g_in, (void*)g_idx, (void*)g_out);
-    fflush(stderr);
+    g_in  = (uint16_t*)try_pinned_alloc(INPUT_ELEMS * sizeof(uint16_t), "input");
+    g_idx = (int64_t*) try_pinned_alloc(INDEX_ELEMS * sizeof(int64_t),  "index");
+    g_out = (uint16_t*)try_pinned_alloc(OUTPUT_ELEMS * sizeof(uint16_t), "output");
 }
 
 static inline void cpu_gather_half(void) {
@@ -74,10 +120,10 @@ torch::Tensor bang_func(torch::Tensor input,
                    CNRT_MEM_TRANS_DIR_HOST2DEV);
 
     } else {
-        TORCH_CHECK(false, "v110_78b only supports half");
+        TORCH_CHECK(false, "v110_78c only supports half");
     }
 
-    fprintf(stderr, "[V78B] cnMallocHost pinned host gather\n");
+    fprintf(stderr, "[V78C] dlsym pinned fallback gather\n");
     fflush(stderr);
 
     return output;
