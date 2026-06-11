@@ -1,24 +1,40 @@
-// 110_Gather_rows v110_73_align_attr
-// v66b 的进阶版：g_in/g_idx/g_out 用 __attribute__((aligned(4096))) 强制 4KB 对齐
-// 对齐让 DMA burst 更长，减少 PCIe transaction 开销
-#warning "BUILD_VERSION v110_73_align_attr"
+// 110_Gather_rows v110_74_parallel_d2h
+// v71 的进阶版：D2H index 和 D2H input 并行发起，用两个独立 cnrtQueue
+// CNRT 支持同时发起多个 memcpy，硬件层面可以重叠
+// 加上 row-interleaved gather（与 v66b 相同）
+#warning "BUILD_VERSION v110_74_parallel_d2h"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
 #include <cstdio>
+#include <stdlib.h>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
 
-// 4KB页对齐的静态缓冲区
-static uint16_t g_in [BATCH * N_COL] __attribute__((aligned(4096)));
-static  int64_t g_idx[BATCH * K_COL] __attribute__((aligned(4096)));
-static uint16_t g_out[BATCH * K_COL] __attribute__((aligned(4096)));
+static uint16_t *g_in;
+static  int64_t *g_idx;
+static uint16_t *g_out;
+static bool g_init = false;
+static cnrtQueue_t g_q0;
+static cnrtQueue_t g_q1;
 
-// Row-interleaved gather (same as v66b)
+static void ensure_init(void) {
+    if (g_init) return;
+    if (posix_memalign((void**)&g_in,  4096, BATCH * N_COL * sizeof(uint16_t)) != 0) g_in  = nullptr;
+    if (posix_memalign((void**)&g_idx, 4096, BATCH * K_COL * sizeof(int64_t)) != 0) g_idx = nullptr;
+    if (posix_memalign((void**)&g_out, 4096, BATCH * K_COL * sizeof(uint16_t)) != 0) g_out = nullptr;
+
+    // 创建两个独立 stream queue
+    cnrtQueueCreate(&g_q0);
+    cnrtQueueCreate(&g_q1);
+
+    g_init = true;
+}
+
 static inline void gather8_interleave(
     const uint16_t * in_base[8],
     const  int64_t * idx_base[8],
@@ -35,16 +51,24 @@ static inline void gather8_interleave(
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
+    ensure_init();
 
-    cnrtMemcpy(g_idx,
-               index.data_ptr<int64_t>(),
-               BATCH * K_COL * sizeof(int64_t),
-               CNRT_MEM_TRANS_DIR_DEV2HOST);
+    // 同一时刻发起两个 D2H（并行传输 index + input）
+    cnrtMemcpyAsync(g_idx,
+                    index.data_ptr<int64_t>(),
+                    BATCH * K_COL * sizeof(int64_t),
+                    CNRT_MEM_TRANS_DIR_DEV2HOST,
+                    g_q0);
 
-    cnrtMemcpy(g_in,
-               input.data_ptr(),
-               BATCH * N_COL * sizeof(uint16_t),
-               CNRT_MEM_TRANS_DIR_DEV2HOST);
+    cnrtMemcpyAsync(g_in,
+                    input.data_ptr(),
+                    BATCH * N_COL * sizeof(uint16_t),
+                    CNRT_MEM_TRANS_DIR_DEV2HOST,
+                    g_q1);
+
+    // 等两个 queue 都完成
+    cnrtQueueWait(g_q0);
+    cnrtQueueWait(g_q1);
 
     for (int g = 0; g < BATCH; g += 8) {
         const uint16_t *in_ptrs[8];
@@ -63,7 +87,7 @@ torch::Tensor bang_func(torch::Tensor input,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V73] __attribute__((aligned(4096)))\n");
+    fprintf(stderr, "[V74] parallel D2H via cnrtQueue\n");
     fflush(stderr);
 
     return output;
