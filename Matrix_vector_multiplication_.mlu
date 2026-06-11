@@ -11,7 +11,7 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    // 多核拆分
+    // 多核拆分变量
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = M / core_num;
@@ -26,16 +26,15 @@ __mlu_entry__ void gemv_kernel(
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
     __nram__ float nram_mul[CHUNK_SIZE];
-    __nram__ float nram_sum[1];   // 向量累加器，长度为1
+    __nram__ float nram_sum[1];          // 累加器向量
 
-    // 循环控制变量与归约变量（全部前置声明）
+    // 循环控制与归约变量（全部前置声明）
     uint32_t i, row, k, len, aligned_len;
-    uint32_t reduce_len, half;
+    uint32_t cur_len, len_half;          // 用于折半归约的安全变量名
 
     for (i = 0; i < count_row; ++i) {
         row = start_row + i;
-        // 累加器初始化为0
-        __bang_write_zero(nram_sum, 1);
+        __bang_write_zero(nram_sum, 1);   // 初始化累加器
 
         for (k = 0; k < K; k += CHUNK_SIZE) {
             len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
@@ -52,19 +51,20 @@ __mlu_entry__ void gemv_kernel(
             // 逐元素乘法
             __bang_mul(nram_mul, nram_a, nram_b, aligned_len);
 
-            // 手动折半归约求和：每次将前后半相加，长度减半，直到1
-            reduce_len = aligned_len;
-            while (reduce_len > 1) {
-                half = reduce_len / 2;
-                __bang_add(nram_mul, nram_mul, nram_mul + half, half);
-                reduce_len = half;
+            // 手动折半归约求和（替代 __bang_reduce_sum）
+            cur_len = aligned_len;
+            while (cur_len > 1) {
+                len_half = cur_len / 2;
+                __bang_add(nram_mul, nram_mul, nram_mul + len_half, len_half);
+                cur_len = len_half;
             }
-            // 此时 nram_mul[0] 是这段分块的点积结果
+            // nram_mul[0] 现在是该分块的和
+
             // 向量累加（长度1）
             __bang_add(nram_sum, nram_sum, nram_mul, 1);
         }
 
-        // 写回最终结果
+        // 写回结果
         __memcpy(C + row, nram_sum, sizeof(float), NRAM2GDRAM);
     }
 }
