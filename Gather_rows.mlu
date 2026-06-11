@@ -1,8 +1,7 @@
-// 110_Gather_rows v110_91_gather_7arg
-// 精确使用 7 参数版 __gather：对比 v78 签名
-// v78 能编译（根据历史记录），这里仅确保 launch 方式和 v90 保持一致
-// 签名: __gather(dst, src, offset, elem_size, dir_A, dir_B, count)
-#warning "BUILD_VERSION v110_91_gather_7arg"
+// 110_Gather_rows v110_91_bang_gather
+// 改用 __bang_gather: __gather 在 compute_30 上 direction 全不支持
+// 改用 v93 方案: idx 先 __memcpy 到 NRAM，再 __bang_gather
+#warning "BUILD_VERSION v110_91_bang_gather"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -34,19 +33,24 @@ __mlu_entry__ void gather_kernel(
 
     __nram__ unsigned short off[TOTAL_K];
     __nram__ uint16_t nram_out[TOTAL_K];
+    __nram__ int64_t nram_idx[TOTAL_K];
 
+    // idx 从 GDRAM 拷到 NRAM（避免 unified addressing 问题）
+    __memcpy(nram_idx, idx, TOTAL_K * 8, GDRAM2NRAM);
+
+    // 构建元素偏移量
     for (int b = 0; b < BATCH; ++b) {
         int base = b * K_COL;
         int row  = b * N_COL;
         for (int k = 0; k < K_COL; ++k) {
-            off[base + k] = (unsigned short)(row + (int)idx[base + k]);
+            off[base + k] = (unsigned short)(row + (int)nram_idx[base + k]);
         }
     }
 
-    // 7 参数：dst, src, offset, elem_size, dir_A, dir_B, count
-    // GDRAM2NRAM=0 -> NRAM2NRAM 作为 dst direction
-    __gather(nram_out, input, off, 2, NRAM2NRAM, NRAM2NRAM, TOTAL_K);
+    // __bang_gather: GDRAM -> NRAM
+    __bang_gather(nram_out, input, (int16_t*)off, TOTAL_K, 2, 1, 1);
 
+    // NRAM -> GDRAM
     __memcpy(output, nram_out, TOTAL_K * 2, NRAM2GDRAM);
 }
 
@@ -75,7 +79,7 @@ torch::Tensor bang_func(torch::Tensor input,
 
     cnrtQueueSync(queue);
 
-    fprintf(stderr, "[V91] 7-arg __gather\n");
+    fprintf(stderr, "[V91] __bang_gather, idx->NRAM\n");
     fflush(stderr);
 
     return output;
