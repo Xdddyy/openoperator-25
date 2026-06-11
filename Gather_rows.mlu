@@ -1,8 +1,7 @@
-// 110_Gather_rows v110_75_minimal_d2h
-// 策略：只 D2H index（16KB），input/output 留在 GDRAM
-// MLU kernel 直接从 GDRAM gather，不做 input D2H
-// 验证：如果 __gather 从 GDRAM 直接读比 D2H+CPU读更快，就是正确方向
-#warning "BUILD_VERSION v110_75_minimal_d2h"
+// 110_Gather_rows v110_77_minimal_d2h_fixed
+// v75 的修复版：__gather 用字面值 elem_size，不依赖 sizeof
+// 同样只 D2H index（16KB），MLU kernel 从 GDRAM 直接 gather
+#warning "BUILD_VERSION v110_77_minimal_d2h_fixed"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -14,7 +13,7 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define TOTAL_K  (BATCH * K_COL)  // 2048 elements
+#define TOTAL_K  2048  // BATCH*K_COL，字面值常量
 
 static  int64_t *g_idx;
 static bool g_init = false;
@@ -26,37 +25,31 @@ static void ensure_init(void) {
 }
 
 __mlu_entry__ void gather_kernel(
-    const uint16_t *input,  // GDRAM
-    const int64_t  *idx,   // passed from host (g_idx in NRAM)
-    uint16_t *output        // GDRAM
+    const uint16_t * __nram__ input,
+    const  int64_t * __nram__ idx,
+    uint16_t * __nram__ output
 ) {
     if (taskId != 0) return;
 
-    // NRAM buffers
     __nram__ unsigned short off[TOTAL_K];
-    __nram__ uint16_t nram_idx[TOTAL_K];
     __nram__ uint16_t nram_out[TOTAL_K];
 
-    // Copy index from param to NRAM (param is already in NRAM/g_idx)
-    // Since idx is passed as NRAM pointer (g_idx), just cast
-    for (int i = 0; i < TOTAL_K; ++i) {
-        nram_idx[i] = (unsigned short)idx[i];
-    }
-
-    // Build offset table in NRAM
+    // Build offset table (element offsets, not bytes)
     for (int b = 0; b < BATCH; ++b) {
         int base = b * K_COL;
         int row  = b * N_COL;
         for (int k = 0; k < K_COL; ++k) {
-            off[base + k] = (unsigned short)(row + (int)nram_idx[base + k]);
+            int v = row + (int)idx[base + k];
+            off[base + k] = (unsigned short)v;
         }
     }
 
-    // __gather: read from GDRAM input, scatter to NRAM
+    // __gather: read from GDRAM input via offset, write to NRAM
+    // elem_size=2 (half), src_dir=GDRAM2NRAM
     __gather(nram_out,
              input,
              off,
-             sizeof(uint16_t),
+             2,            // 字面值常量，不用 sizeof
              NRAM2NRAM,
              GDRAM2NRAM,
              TOTAL_K);
@@ -70,7 +63,7 @@ torch::Tensor bang_func(torch::Tensor input,
     auto output = torch::empty({BATCH, K_COL}, input.options());
     ensure_init();
 
-    // Only D2H index (16KB) — minimal transfer
+    // Only D2H index (16KB) — no input D2H
     cnrtMemcpy(g_idx,
                index.data_ptr<int64_t>(),
                BATCH * K_COL * sizeof(int64_t),
@@ -80,14 +73,13 @@ torch::Tensor bang_func(torch::Tensor input,
     cnrtDim3_t dim = {1, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    // Pass GDRAM input pointer, NRAM index pointer
     gather_kernel<<<dim, ktype, queue>>>(
-        (const uint16_t*)input.data_ptr(),  // GDRAM (MLU reads directly)
-        g_idx,                              // NRAM (host-copied)
-        (uint16_t*)output.data_ptr()         // GDRAM
+        (const uint16_t*)input.data_ptr(),
+        g_idx,
+        (uint16_t*)output.data_ptr()
     );
 
-    fprintf(stderr, "[V75] minimal D2H (index only), MLU gather from GDRAM\n");
+    fprintf(stderr, "[V77] minimal D2H, MLU gather from GDRAM\n");
     fflush(stderr);
 
     return output;
