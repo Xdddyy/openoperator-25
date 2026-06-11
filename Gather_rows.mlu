@@ -1,9 +1,8 @@
-// 110_Gather_rows v110_85_gather_clean
-// v78 修复：简化 __gather 参数
-// 1. 去掉 NRAM2NRAM，src=dst 都是 NRAM 用 GDRAM2NRAM 是可以的
-// 2. offset 用 addr 模式（相对于 base 的 byte offset）
-// 3. 验证 g_idx 的 4KB 对齐是否影响 __gather
-#warning "BUILD_VERSION v110_85_gather_clean"
+// 110_Gather_rows v110_91_gather_7arg
+// 精确使用 7 参数版 __gather：对比 v78 签名
+// v78 能编译（根据历史记录），这里仅确保 launch 方式和 v90 保持一致
+// 签名: __gather(dst, src, offset, elem_size, dir_A, dir_B, count)
+#warning "BUILD_VERSION v110_91_gather_7arg"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -15,39 +14,37 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define TOTAL_K (BATCH * K_COL)  // 2048
+#define TOTAL_K (BATCH * K_COL)
 
 static int64_t *g_idx;
 static bool g_init = false;
 
 static void ensure_init(void) {
     if (g_init) return;
-    // g_idx 4KB 对齐
     if (posix_memalign((void**)&g_idx, 4096, BATCH * K_COL * sizeof(int64_t)) != 0) g_idx = nullptr;
     g_init = true;
 }
 
 __mlu_entry__ void gather_kernel(
-    const uint16_t *input,  // GDRAM [BATCH, N_COL]
-    const  int64_t *idx,    // GDRAM (host-copied)
-    uint16_t *output         // GDRAM [BATCH, K_COL]
+    const uint16_t *input,
+    const  int64_t *idx,
+    uint16_t *output
 ) {
     if (taskId != 0) return;
 
     __nram__ unsigned short off[TOTAL_K];
     __nram__ uint16_t nram_out[TOTAL_K];
 
-    // 构建 byte offset（不是元素 offset）
     for (int b = 0; b < BATCH; ++b) {
         int base = b * K_COL;
         int row  = b * N_COL;
         for (int k = 0; k < K_COL; ++k) {
-            // byte offset = (row + idx) * 2
-            off[base + k] = (unsigned short)((row + (int)idx[base + k]) * 2);
+            off[base + k] = (unsigned short)(row + (int)idx[base + k]);
         }
     }
 
-    __gather(nram_out, input, off, 2, NRAM2GDRAM, TOTAL_K);
+    // 7 参数：dst, src, offset, elem_size, dir_A, dir_B, count
+    __gather(nram_out, input, off, 2, NRAM2NRAM, GDRAM2NRAM, TOTAL_K);
 
     __memcpy(output, nram_out, TOTAL_K * 2, NRAM2GDRAM);
 }
@@ -57,23 +54,30 @@ torch::Tensor bang_func(torch::Tensor input,
     auto output = torch::empty({BATCH, K_COL}, input.options());
     ensure_init();
 
-    // 只 D2H index（16KB）
     cnrtMemcpy(g_idx,
                index.data_ptr<int64_t>(),
                BATCH * K_COL * sizeof(int64_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
+    auto input_cont  = input.contiguous();
+    auto output_cont = output.contiguous();
+
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
     cnrtDim3_t dim = {1, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
 
-    gather_kernel<<<dim, ktype, queue>>>(
-        (const uint16_t*)input.data_ptr(),
-        g_idx,
-        (uint16_t*)output.data_ptr()
-    );
+    CNRT_CHECK(cnrtLaunchKernel(gather_kernel,
+                                dim.x, dim.y, dim.z,
+                                nullptr, 0,
+                                queue,
+                                ktype,
+                                (void*)input_cont.data_ptr(),
+                                (void*)g_idx,
+                                (void*)output_cont.data_ptr()));
 
-    fprintf(stderr, "[V85] clean __gather, byte offset addr mode\n");
+    cnrtQueueSync(queue);
+
+    fprintf(stderr, "[V91] 7-arg __gather\n");
     fflush(stderr);
 
     return output;
