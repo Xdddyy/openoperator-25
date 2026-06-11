@@ -1,0 +1,103 @@
+// 110_Gather_rows v110_61_host_memcpy_cpu_gather
+#warning "BUILD_VERSION v110_61_host_memcpy_cpu_gather"
+
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <cstdio>
+#include <cstring>
+
+#define BATCH 64
+#define N_COL 1024
+#define K_COL 32
+
+#define INPUT_ELEMS  (BATCH * N_COL)
+#define INDEX_ELEMS  (BATCH * K_COL)
+#define OUTPUT_ELEMS (BATCH * K_COL)
+
+static uint16_t h_input_half[INPUT_ELEMS];
+static uint16_t h_output_half[OUTPUT_ELEMS];
+
+static float h_input_float[INPUT_ELEMS];
+static float h_output_float[OUTPUT_ELEMS];
+
+static int64_t h_index[INDEX_ELEMS];
+
+torch::Tensor bang_func(torch::Tensor input, torch::Tensor index) {
+    auto output = torch::empty({BATCH, K_COL}, input.options());
+
+    // 先把 index 拷到 host
+    cnrtMemcpy(
+        h_index,
+        index.data_ptr<int64_t>(),
+        INDEX_ELEMS * sizeof(int64_t),
+        CNRT_MEM_TRANS_DIR_DEV2HOST
+    );
+
+    if (input.scalar_type() == torch::kHalf) {
+        // half 只做 bit-copy，不需要数值转换
+        cnrtMemcpy(
+            h_input_half,
+            input.data_ptr(),
+            INPUT_ELEMS * sizeof(uint16_t),
+            CNRT_MEM_TRANS_DIR_DEV2HOST
+        );
+
+        for (int b = 0; b < BATCH; ++b) {
+            int in_base = b * N_COL;
+            int idx_base = b * K_COL;
+            int out_base = b * K_COL;
+
+            for (int k = 0; k < K_COL; ++k) {
+                int col = (int)h_index[idx_base + k];
+                h_output_half[out_base + k] =
+                    h_input_half[in_base + col];
+            }
+        }
+
+        cnrtMemcpy(
+            output.data_ptr(),
+            h_output_half,
+            OUTPUT_ELEMS * sizeof(uint16_t),
+            CNRT_MEM_TRANS_DIR_HOST2DEV
+        );
+
+    } else if (input.scalar_type() == torch::kFloat32) {
+        cnrtMemcpy(
+            h_input_float,
+            input.data_ptr<float>(),
+            INPUT_ELEMS * sizeof(float),
+            CNRT_MEM_TRANS_DIR_DEV2HOST
+        );
+
+        for (int b = 0; b < BATCH; ++b) {
+            int in_base = b * N_COL;
+            int idx_base = b * K_COL;
+            int out_base = b * K_COL;
+
+            for (int k = 0; k < K_COL; ++k) {
+                int col = (int)h_index[idx_base + k];
+                h_output_float[out_base + k] =
+                    h_input_float[in_base + col];
+            }
+        }
+
+        cnrtMemcpy(
+            output.data_ptr(),
+            h_output_float,
+            OUTPUT_ELEMS * sizeof(float),
+            CNRT_MEM_TRANS_DIR_HOST2DEV
+        );
+
+    } else {
+        TORCH_CHECK(false, "v110_61 supports only float16/float32 input");
+    }
+
+    fprintf(stderr,
+            "[HOST_GATHER] dtype=%d\n",
+            (int)input.scalar_type());
+    fflush(stderr);
+
+    return output;
+}

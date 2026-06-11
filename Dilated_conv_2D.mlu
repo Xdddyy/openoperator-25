@@ -1,0 +1,258 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define OC_GROUP 8
+#define H_TILE 32
+#define W_MAX 256
+#define IN_TILE_ELEMS 16384
+#define OUT_TILE_ELEMS (OC_GROUP * H_TILE * W_MAX)
+
+__mlu_entry__ void dilated_conv2d_kernel(
+    const float* input,       // [N, C_in, H, W]
+    const float* weight,      // [C_out, C_in, kH, kW]
+    float* output,            // [N, C_out, H_out, W_out]
+    int N,
+    int C_in,
+    int H,
+    int W,
+    int C_out,
+    int kH,
+    int kW,
+    int H_out,
+    int W_out,
+    int stride_h,
+    int stride_w,
+    int padding_h,
+    int padding_w,
+    int dilation_h,
+    int dilation_w)
+{
+    // 各维度步长
+    int in_batch_stride   = C_in * H * W;
+    int in_channel_stride = H * W;
+    int w_oc_stride       = C_in * kH * kW;
+    int w_ic_stride       = kH * kW;
+    int out_batch_stride  = C_out * H_out * W_out;
+    int out_oc_stride     = H_out * W_out;
+
+    __nram__ float nram_in[IN_TILE_ELEMS];
+    __nram__ float nram_out[OUT_TILE_ELEMS];
+    __nram__ float nram_tmp[W_MAX];
+
+    int oc_groups = (C_out + OC_GROUP - 1) / OC_GROUP;
+    int h_tiles = (H_out + H_TILE - 1) / H_TILE;
+    int total_tasks = N * oc_groups * h_tiles;
+
+    for (int linear_task = taskId; linear_task < total_tasks; linear_task += taskDim) {
+        int h_tile_id = linear_task % h_tiles;
+        int tmp_task = linear_task / h_tiles;
+        int oc_group_id = tmp_task % oc_groups;
+        int n = tmp_task / oc_groups;
+
+        int oh_tile_start = h_tile_id * H_TILE;
+        int oh_tile_end = oh_tile_start + H_TILE;
+        if (oh_tile_end > H_out) oh_tile_end = H_out;
+        int cur_tile_h = oh_tile_end - oh_tile_start;
+
+        int oc_start = oc_group_id * OC_GROUP;
+        int oc_end = oc_start + OC_GROUP;
+        if (oc_end > C_out) oc_end = C_out;
+        int cur_oc = oc_end - oc_start;
+
+        int load_ih_start = oh_tile_start * stride_h - padding_h;
+        if (load_ih_start < 0) load_ih_start = 0;
+        if (load_ih_start > H) load_ih_start = H;
+        int load_ih_end = (oh_tile_end - 1) * stride_h
+                          + (kH - 1) * dilation_h - padding_h + 1;
+        if (load_ih_end < 0) load_ih_end = 0;
+        if (load_ih_end > H) load_ih_end = H;
+        int num_in_rows = load_ih_end - load_ih_start;
+        if (num_in_rows <= 0) continue;
+
+        int in_tile_size = num_in_rows * W;
+        int out_tile_size = cur_oc * cur_tile_h * W_out;
+        if (W_out > W_MAX || W > W_MAX ||
+            in_tile_size > IN_TILE_ELEMS ||
+            out_tile_size > OUT_TILE_ELEMS) {
+            continue;
+        }
+
+        __bang_write_zero(nram_out, out_tile_size);
+
+        for (int ic = 0; ic < C_in; ic++) {
+            const float* in_ch_base =
+                input + n * in_batch_stride + ic * in_channel_stride;
+
+            __memcpy(
+                nram_in,
+                in_ch_base + load_ih_start * W,
+                in_tile_size * sizeof(float),
+                GDRAM2NRAM);
+
+            for (int oc_local = 0; oc_local < cur_oc; oc_local++) {
+                int oc = oc_start + oc_local;
+                const float* w_base = weight + oc * w_oc_stride + ic * w_ic_stride;
+                float* nram_out_oc = nram_out + oc_local * cur_tile_h * W_out;
+
+                for (int kh = 0; kh < kH; kh++) {
+                    for (int oh = oh_tile_start; oh < oh_tile_end; oh++) {
+                        int ih = oh * stride_h + kh * dilation_h - padding_h;
+                        if (ih < 0 || ih >= H) continue;
+
+                        int nram_in_row = ih - load_ih_start;
+                        int nram_out_row = oh - oh_tile_start;
+                        float* out_row = nram_out_oc + nram_out_row * W_out;
+
+                        for (int kw = 0; kw < kW; kw++) {
+                            float w_val = w_base[kh * kW + kw];
+                            if (w_val == 0.0f) continue;
+
+                            int iw_offset = kw * dilation_w - padding_w;
+                            int ow_start = -iw_offset;
+                            if (ow_start < 0) ow_start = 0;
+                            int ow_end = W - iw_offset;
+                            if (ow_end > W_out) ow_end = W_out;
+                            int valid_w = ow_end - ow_start;
+                            if (valid_w <= 0) continue;
+
+                            int iw_start = ow_start + iw_offset;
+                            __bang_mul_scalar(
+                                nram_tmp,
+                                nram_in + nram_in_row * W + iw_start,
+                                w_val,
+                                valid_w);
+                            __bang_add(
+                                out_row + ow_start,
+                                out_row + ow_start,
+                                nram_tmp,
+                                valid_w);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (int oc_local = 0; oc_local < cur_oc; oc_local++) {
+            int oc = oc_start + oc_local;
+            float* out_gdram = output + n * out_batch_stride
+                               + oc * out_oc_stride
+                               + oh_tile_start * W_out;
+            float* nram_out_oc = nram_out + oc_local * cur_tile_h * W_out;
+
+            __memcpy(
+                out_gdram,
+                nram_out_oc,
+                cur_tile_h * W_out * sizeof(float),
+                NRAM2GDRAM);
+        }
+    }
+}
+
+
+/* ============================================================================
+ * bang_func — 外部调用接口
+ *
+ * 严格匹配 C++ Wrapper 签名:
+ *   torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel,
+ *       int in_channels, int out_channels, int kernel_size,
+ *       int dilation, int padding);
+ *
+ * 内部行为与 PyTorch nn.Conv2d 对齐:
+ *   - stride = 1 (默认)
+ *   - bias = False (无偏置)
+ *   - dilation / padding 为方形参数
+ *   - 空洞卷积输出尺寸公式:
+ *     H_out = (H + 2*pad - dil*(K-1) - 1) / stride + 1
+ *     W_out = (W + 2*pad - dil*(K-1) - 1) / stride + 1
+ *
+ * 参数:
+ *   x:           输入张量，形状 [batch, in_channels, H, W]
+ *   kernel:      卷积核张量，形状 [out_channels, in_channels, K, K]
+ *   in_channels: 输入通道数
+ *   out_channels:输出通道数
+ *   kernel_size: 卷积核尺寸 K
+ *   dilation:    空洞系数
+ *   padding:     填充宽度
+ *
+ * 返回值:
+ *   卷积输出张量，形状 [batch, out_channels, H_out, W_out]
+ * ============================================================================
+ */
+torch::Tensor bang_func(
+    torch::Tensor x,
+    torch::Tensor kernel,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int dilation,
+    int padding)
+{
+    // 输入校验
+    TORCH_CHECK(x.is_contiguous(),      "Input must be contiguous");
+    TORCH_CHECK(kernel.is_contiguous(), "Kernel must be contiguous");
+    TORCH_CHECK(x.dim() == 4,           "Input must be 4D: [N, C, H, W]");
+    TORCH_CHECK(kernel.dim() == 4,      "Kernel must be 4D: [C_out, C_in, kH, kW]");
+
+    // -------- 统一转为 float32 计算 --------
+    torch::Tensor x_fp32      = x;
+    torch::Tensor kernel_fp32 = kernel;
+    if (x.scalar_type() != torch::kFloat) {
+        x_fp32      = x.to(torch::kFloat);
+    }
+    if (kernel.scalar_type() != torch::kFloat) {
+        kernel_fp32 = kernel.to(torch::kFloat);
+    }
+
+    // 维度信息
+    int N     = (int)x_fp32.size(0);
+    int C_in  = (int)x_fp32.size(1);
+    int H     = (int)x_fp32.size(2);
+    int W     = (int)x_fp32.size(3);
+    int C_out = (int)kernel_fp32.size(0);
+    int kH    = (int)kernel_fp32.size(2);
+    int kW    = (int)kernel_fp32.size(3);
+
+    // 参数一致性校验
+    TORCH_CHECK(C_in == in_channels,
+                "in_channels ", in_channels, " != input channel ", C_in);
+    TORCH_CHECK(C_out == out_channels,
+                "out_channels ", out_channels, " != kernel out channel ", C_out);
+    TORCH_CHECK(kH == kernel_size && kW == kernel_size,
+                "kernel_size ", kernel_size, " != kernel shape (", kH, ",", kW, ")");
+
+    // PyTorch nn.Conv2d 不指定 stride 时默认为 1
+    const int stride = 1;
+
+    // 计算输出尺寸 (空洞卷积公式)
+    int H_out = (H + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    int W_out = (W + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+
+    TORCH_CHECK(H_out > 0 && W_out > 0,
+                "Invalid output size: H_out=", H_out, ", W_out=", W_out);
+
+    // -------- 分配输出张量 (与输入在同一设备) --------
+    auto output_fp32 = torch::empty(
+        {N, C_out, H_out, W_out},
+        torch::TensorOptions().dtype(torch::kFloat).device(x_fp32.device()));
+
+    // -------- 获取 MLU Stream 并启动 Kernel --------
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // 使用 cnrtFuncTypeBlock + 16 个任务，充分利用 MLU370 的 16 个核心
+    cnrtDim3_t dim = {16, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    dilated_conv2d_kernel<<<dim, ktype, queue>>>(
+        x_fp32.data_ptr<float>(),
+        kernel_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        N, C_in, H, W,
+        C_out, kH, kW,
+        H_out, W_out,
+        stride, stride,
+        padding, padding,
+        dilation, dilation);
+
+    return output_fp32;
+}

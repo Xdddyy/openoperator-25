@@ -1,0 +1,115 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void adaptive_max_pool2d_kernel(
+    float *input,
+    float *output,
+    int batch,
+    int channels,
+    int H,
+    int W,
+    int out_h,
+    int out_w,
+    int total) {
+
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+
+    __nram__ float nram_buf[CHUNK_SIZE];
+
+    for (uint32_t idx = start; idx < start + count; ++idx) {
+        int tmp = idx;
+        int ow = tmp % out_w;
+        tmp /= out_w;
+        int oh = tmp % out_h;
+        tmp /= out_h;
+        int c = tmp % channels;
+        int b = tmp / channels;
+
+        int h_start = (oh * H) / out_h;
+        int h_end = ((oh + 1) * H + out_h - 1) / out_h;
+        int w_start = (ow * W) / out_w;
+        int w_end = ((ow + 1) * W + out_w - 1) / out_w;
+        if (h_end > H) h_end = H;
+        if (w_end > W) w_end = W;
+
+        float max_val;
+        bool first = true;
+
+        for (int h = h_start; h < h_end; ++h) {
+            int row_offset = ((b * channels + c) * H + h) * W + w_start;
+            int row_len = w_end - w_start;
+
+            for (int w_offset = 0; w_offset < row_len; w_offset += CHUNK_SIZE) {
+                int chunk_len = (w_offset + CHUNK_SIZE <= row_len)
+                                    ? CHUNK_SIZE : (row_len - w_offset);
+
+                __memcpy(nram_buf,
+                         input + row_offset + w_offset,
+                         chunk_len * sizeof(float),
+                         GDRAM2NRAM);
+
+                for (int i = 0; i < chunk_len; ++i) {
+                    if (first) {
+                        max_val = nram_buf[i];
+                        first = false;
+                    } else if (nram_buf[i] > max_val) {
+                        max_val = nram_buf[i];
+                    }
+                }
+            }
+        }
+        output[idx] = max_val;
+    }
+}
+
+// 入口函数，必须命名为 bang_func，接受 vector<int64_t> 表示输出尺寸
+torch::Tensor bang_func(
+    torch::Tensor input,
+    std::vector<int64_t> output_size) {
+
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(output_size.size() == 2, "output_size must have 2 elements");
+
+    int64_t out_h = output_size[0];
+    int64_t out_w = output_size[1];
+
+    auto original_dtype = input.scalar_type();
+    torch::Tensor input_fp32 = input;
+    if (original_dtype != torch::kFloat) {
+        input_fp32 = input.to(torch::kFloat);
+    }
+
+    int batch    = input_fp32.size(0);
+    int channels = input_fp32.size(1);
+    int H        = input_fp32.size(2);
+    int W        = input_fp32.size(3);
+
+    auto output_fp32 = torch::empty({batch, channels, out_h, out_w},
+                                    input_fp32.options());
+    int total = batch * channels * static_cast<int>(out_h) * static_cast<int>(out_w);
+
+    cnrtQueue_t queue = nullptr;
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    adaptive_max_pool2d_kernel<<<dim, ktype, queue>>>(
+        input_fp32.data_ptr<float>(),
+        output_fp32.data_ptr<float>(),
+        batch, channels, H, W,
+        static_cast<int>(out_h),
+        static_cast<int>(out_w),
+        total);
+
+    if (original_dtype != torch::kFloat) {
+        return output_fp32.to(original_dtype);
+    }
+    return output_fp32;
+}

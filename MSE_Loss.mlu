@@ -1,0 +1,43 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+torch::Tensor bang_func(
+    torch::Tensor predictions,
+    torch::Tensor targets) {
+
+    TORCH_CHECK(
+        predictions.sizes() == targets.sizes(),
+        "predictions and targets must have the same shape");
+
+    TORCH_CHECK(
+        predictions.device() == targets.device(),
+        "predictions and targets must be on the same device");
+
+    TORCH_CHECK(
+        predictions.numel() > 0,
+        "MSE input must not be empty");
+
+    auto original_dtype = predictions.scalar_type();
+
+    torch::Tensor pred_fp32 = predictions;
+    torch::Tensor targ_fp32 = targets;
+
+    if (predictions.scalar_type() != torch::kFloat) {
+        pred_fp32 = predictions.to(torch::kFloat);
+    }
+
+    if (targets.scalar_type() != torch::kFloat) {
+        targ_fp32 = targets.to(torch::kFloat);
+    }
+
+    auto diff = pred_fp32 - targ_fp32;
+    auto output = (diff * diff).mean();
+
+    if (original_dtype != torch::kFloat) {
+        output = output.to(original_dtype);
+    }
+
+    return output;
+}
+

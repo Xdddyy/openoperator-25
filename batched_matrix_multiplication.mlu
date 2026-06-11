@@ -1,0 +1,133 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define TILE_N 256
+#define MAX_TASKS 1024
+
+/* ============================================================================
+ * Batched Matrix Multiplication
+ *
+ * A: [batch_size, m, k]
+ * B: [batch_size, k, n]
+ * C: [batch_size, m, n]
+ *
+ * 按输出行和列 tile 并行，每个 task 计算一段 C[batch,row,col:col+TILE_N]。
+ * NRAM 中用 float accumulator 沿 k 维向量化累加，最终写回 float32。
+ * ============================================================================
+ */
+__mlu_entry__ void batched_matmul_row_tile_kernel(
+    float *C,
+    const half *A,
+    const half *B,
+    int batch_size,
+    int m,
+    int k,
+    int n)
+{
+    uint32_t task_id = taskId;
+    uint32_t task_num = taskDim;
+
+    __nram__ half nram_b_half[TILE_N];
+    __nram__ float nram_b_float[TILE_N];
+    __nram__ float nram_tmp[TILE_N];
+    __nram__ float nram_acc[TILE_N];
+
+    int a_elems = m * k;
+    int b_elems = k * n;
+    int c_elems = m * n;
+    int col_tiles = (n + TILE_N - 1) / TILE_N;
+    int total_tiles = batch_size * m * col_tiles;
+
+    for (int tile_id = (int)task_id;
+         tile_id < total_tiles;
+         tile_id += (int)task_num) {
+        int col_tile = tile_id % col_tiles;
+        int row = (tile_id / col_tiles) % m;
+        int batch = tile_id / (col_tiles * m);
+
+        const half *A_batch = A + batch * a_elems;
+        const half *B_batch = B + batch * b_elems;
+        float *C_batch = C + batch * c_elems;
+
+        int col_base = col_tile * TILE_N;
+        int tile_n = n - col_base;
+        if (tile_n > TILE_N) {
+            tile_n = TILE_N;
+        }
+        int aligned_n = (tile_n + 63) & ~63;
+
+        __bang_write_zero(nram_acc, aligned_n);
+
+        for (int kk = 0; kk < k; kk++) {
+            __memcpy(nram_b_half,
+                     B_batch + kk * n + col_base,
+                     tile_n * sizeof(half),
+                     GDRAM2NRAM);
+            for (int i = tile_n; i < aligned_n; i++) {
+                nram_b_half[i] = (half)0.0f;
+            }
+
+            __bang_half2float(nram_b_float, nram_b_half, aligned_n);
+            float a_val = (float)A_batch[row * k + kk];
+            __bang_mul_scalar(nram_tmp, nram_b_float, a_val, aligned_n);
+            __bang_add(nram_acc, nram_acc, nram_tmp, aligned_n);
+        }
+
+        __memcpy(C_batch + row * n + col_base,
+                 nram_acc,
+                 tile_n * sizeof(float),
+                 NRAM2GDRAM);
+    }
+}
+
+
+torch::Tensor bang_func(
+    torch::Tensor A,
+    torch::Tensor B)
+{
+    TORCH_CHECK(A.is_contiguous(), "Input tensor A must be contiguous");
+    TORCH_CHECK(B.is_contiguous(), "Input tensor B must be contiguous");
+    TORCH_CHECK(A.scalar_type() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(B.scalar_type() == torch::kFloat16, "B must be float16");
+    TORCH_CHECK(A.dim() == 3, "A must be 3D: [batch_size, m, k]");
+    TORCH_CHECK(B.dim() == 3, "B must be 3D: [batch_size, k, n]");
+
+    int batch_size = (int)A.size(0);
+    int m = (int)A.size(1);
+    int k = (int)A.size(2);
+    int b_batch = (int)B.size(0);
+    int b_k = (int)B.size(1);
+    int n = (int)B.size(2);
+
+    TORCH_CHECK(batch_size == b_batch,
+                "A and B must have the same batch_size");
+    TORCH_CHECK(k == b_k,
+                "A.size(2) must equal B.size(1)");
+    TORCH_CHECK(batch_size > 0, "batch_size must be greater than 0");
+    TORCH_CHECK(m > 0, "m must be greater than 0");
+    TORCH_CHECK(k > 0, "k must be greater than 0");
+    TORCH_CHECK(n > 0, "n must be greater than 0");
+
+    auto C = torch::empty({batch_size, m, n},
+                          A.options().dtype(torch::kFloat));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    int col_tiles = (n + TILE_N - 1) / TILE_N;
+    int total_tiles = batch_size * m * col_tiles;
+    int task_num = (total_tiles < MAX_TASKS) ? total_tiles : MAX_TASKS;
+    cnrtDim3_t dim = {static_cast<unsigned int>(task_num), 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    batched_matmul_row_tile_kernel<<<dim, ktype, queue>>>(
+        C.data_ptr<float>(),
+        reinterpret_cast<const half *>(A.data_ptr<at::Half>()),
+        reinterpret_cast<const half *>(B.data_ptr<at::Half>()),
+        batch_size,
+        m,
+        k,
+        n);
+
+    return C;
+}
