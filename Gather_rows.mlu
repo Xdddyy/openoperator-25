@@ -41,23 +41,23 @@ static inline void gather_row(
 // 单线程：拉自己的行 + gather
 static void worker(
     int tid,
-    const void *in_dev_ptr,    // 原始 device 指针
-    const void *idx_dev_ptr
+    const uint16_t *in_dev_ptr,
+    const int64_t  *idx_dev_ptr
 ) {
     int row_start = tid * ROWS_PER_T;
-    uint16_t *local_in = g_in_t[tid];
+    uint16_t *local_in  = g_in_t[tid];
     int64_t  *local_idx = g_idx_t[tid];
     uint16_t *out = g_out + row_start * K_COL;
 
     // D2H: input rows
     cnrtMemcpy(local_in,
-               (const char*)in_dev_ptr + row_start * N_COL * sizeof(uint16_t),
+               (void*)(in_dev_ptr + row_start * N_COL),
                ROWS_PER_T * N_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
     // D2H: index rows
     cnrtMemcpy(local_idx,
-               (const char*)idx_dev_ptr + row_start * K_COL * sizeof(int64_t),
+               (void*)(idx_dev_ptr + row_start * K_COL),
                ROWS_PER_T * K_COL * sizeof(int64_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
@@ -73,8 +73,8 @@ torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
-    const void *in_dev  = input.data_ptr();
-    const void *idx_dev = index.data_ptr<int64_t>();
+    const uint16_t *in_dev  = (const uint16_t*)input.data_ptr();
+    const int64_t  *idx_dev = index.data_ptr<int64_t>();
 
     // 8 线程并行
     std::vector<std::thread> threads;
