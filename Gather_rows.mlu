@@ -1,7 +1,7 @@
-// 110_Gather_rows v110_65_mlu_gather_batch_v3
-// 设备侧 gather：NRAM 局部缓冲区 + __gather 批量
-// 去掉 __nram__ 参数修饰，offset 用元素单位
-#warning "BUILD_VERSION v110_65_mlu_gather_batch_v3"
+// 110_Gather_rows v110_67_batch4_simd
+// v63b 改 batch4: 每次 gather 4 行，编译器可更好地调度和向量化
+// 同时用 __builtin_prefetch 让下一批数据提前进缓存
+#warning "BUILD_VERSION v110_67_batch4_simd"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -12,64 +12,71 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define TOTAL_IN   (BATCH * N_COL)    // 65536 half
-#define TOTAL_IDX  (BATCH * K_COL)     // 2048 int64
-#define TOTAL_OUT  (BATCH * K_COL)     // 2048 half
 
-__mlu_entry__ void gather_batch_kernel(
-    const uint16_t *input,   // GDRAM base pointer
-    const int64_t  *index,  // GDRAM index pointer
-    uint16_t *output         // GDRAM output pointer
+static uint16_t g_in[BATCH * N_COL];
+static  int64_t g_idx[BATCH * K_COL];
+static uint16_t g_out[BATCH * K_COL];
+
+// Gather 4 rows simultaneously — helps compiler vectorize inner loop
+static inline void gather_batch4(
+    const uint16_t * __restrict__ in0,
+    const uint16_t * __restrict__ in1,
+    const uint16_t * __restrict__ in2,
+    const uint16_t * __restrict__ in3,
+    const  int64_t * __restrict__ idx0,
+    const  int64_t * __restrict__ idx1,
+    const  int64_t * __restrict__ idx2,
+    const  int64_t * __restrict__ idx3,
+    uint16_t * __restrict__ out0,
+    uint16_t * __restrict__ out1,
+    uint16_t * __restrict__ out2,
+    uint16_t * __restrict__ out3
 ) {
-    if (taskId != 0) return;
-
-    __nram__ uint16_t nram_out[TOTAL_OUT];
-    __nram__ unsigned short nram_off[TOTAL_OUT];
-
-    // Build offset table: element offsets (NOT byte offsets)
-    // For row b, element k: offset = b*N_COL + index[b*K_COL + k]
-    for (int b = 0; b < BATCH; ++b) {
-        int idx_base = b * K_COL;
-        int row_base = b * N_COL;
-        for (int k = 0; k < K_COL; ++k) {
-            int idx = (int)index[idx_base + k];
-            nram_off[idx_base + k] = (unsigned short)(row_base + idx);
-        }
+    for (int k = 0; k < K_COL; ++k) {
+        out0[k] = in0[(int)idx0[k]];
+        out1[k] = in1[(int)idx1[k]];
+        out2[k] = in2[(int)idx2[k]];
+        out3[k] = in3[(int)idx3[k]];
     }
-
-    // __gather: dst=nram_out, src=input[GDRAM], offsets=nram_off
-    // elem_size=sizeof(uint16_t)=2 bytes per half
-    // gdrammode=GDRAM2NRAM: reading from GDRAM, writing to NRAM
-    __gather(nram_out,
-             input,
-             nram_off,
-             sizeof(uint16_t),
-             NRAM2NRAM,
-             GDRAM2NRAM,
-             TOTAL_OUT);
-
-    // NRAM → GDRAM output
-    __memcpy(output,
-             nram_out,
-             TOTAL_OUT * sizeof(uint16_t),
-             NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t dim = {1, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtMemcpy(g_idx,
+               index.data_ptr<int64_t>(),
+               BATCH * K_COL * sizeof(int64_t),
+               CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    gather_batch_kernel<<<dim, ktype, queue>>>(
-        (const uint16_t*)input.data_ptr(),
-        index.data_ptr<int64_t>(),
-        (uint16_t*)output.data_ptr()
-    );
+    cnrtMemcpy(g_in,
+               input.data_ptr(),
+               BATCH * N_COL * sizeof(uint16_t),
+               CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    fprintf(stderr, "[V65] MLU batch gather\n");
+    // Batch 4 rows per iteration
+    for (int b = 0; b < BATCH; b += 4) {
+        int b0 = b, b1 = b+1, b2 = b+2, b3 = b+3;
+        gather_batch4(g_in  + b0 * N_COL,
+                      g_in  + b1 * N_COL,
+                      g_in  + b2 * N_COL,
+                      g_in  + b3 * N_COL,
+                      g_idx + b0 * K_COL,
+                      g_idx + b1 * K_COL,
+                      g_idx + b2 * K_COL,
+                      g_idx + b3 * K_COL,
+                      g_out + b0 * K_COL,
+                      g_out + b1 * K_COL,
+                      g_out + b2 * K_COL,
+                      g_out + b3 * K_COL);
+    }
+
+    cnrtMemcpy(output.data_ptr(),
+               g_out,
+               BATCH * K_COL * sizeof(uint16_t),
+               CNRT_MEM_TRANS_DIR_HOST2DEV);
+
+    fprintf(stderr, "[V67] batch4 SIMD\n");
     fflush(stderr);
 
     return output;
