@@ -4,7 +4,7 @@
 
 #define CHUNK_SIZE 4096
 
-/* GEMV 内核：C = A * B，A 形状 [M, K]，B 形状 [K]，C 形状 [M, 1] */
+/* 内核函数：C = A * B */
 __mlu_entry__ void gemv_kernel(
     float *A,
     float *B,
@@ -12,7 +12,7 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    // 多核拆分：沿 M 方向均分行
+    // --- 多核拆分 M 行 ---
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = M / core_num;
@@ -23,24 +23,23 @@ __mlu_entry__ void gemv_kernel(
     uint32_t count_row = per_core +
                          (core_id < remainder ? 1 : 0);
 
-    // NRAM 缓冲区
+    // --- NRAM 缓冲区 ---
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
     __nram__ float nram_mul[CHUNK_SIZE];
-    __nram__ float nram_sum;                 // 归约结果
-    __nram__ float nram_out;                 // 单行结果
+    __nram__ float nram_sum;
+    __nram__ float nram_out;
 
-    // 遍历负责的所有行
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
-        float accumulator = 0.0f;
+        float accum = 0.0f;
 
         // 沿 K 方向分块计算点积
         for (uint32_t k = 0; k < K; k += CHUNK_SIZE) {
             uint32_t len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
             uint32_t aligned_len = (len + 63) & ~63;   // 64 字节对齐
 
-            // 清空缓冲区并加载 B 的片段（超出部分为 0）
+            // 加载 B 片段（多余部分通过 write_zero 置零）
             __bang_write_zero(nram_b, aligned_len);
             __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
@@ -54,26 +53,26 @@ __mlu_entry__ void gemv_kernel(
             // 归约求和
             __bang_reduce_sum(&nram_sum, nram_mul, aligned_len);
 
-            accumulator += nram_sum;
+            accum += nram_sum;
         }
 
-        // 将结果写入全局内存
-        nram_out = accumulator;
+        // 写入全局内存
+        nram_out = accum;
         __memcpy(C + row, &nram_out, sizeof(float), NRAM2GDRAM);
     }
 }
 
-/* PyTorch 调用入口 */
-torch::Tensor gemv_bang(
+/* PyTorch 入口函数（必须是 bang_func） */
+torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
 
-    // 基础形状与连续性检查
+    // --- 输入检查 ---
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be a 2D matrix");
     TORCH_CHECK(B.dim() == 2 || B.dim() == 1,
-                "B must be a 1D vector or [K, 1] tensor");
+                "B must be a 1D vector or [K,1] tensor");
 
     int64_t M = A.size(0);
     int64_t K = A.size(1);
@@ -85,7 +84,7 @@ torch::Tensor gemv_bang(
         TORCH_CHECK(B.size(0) == K, "B length must be K");
     }
 
-    // 保留原始数据类型，统一转换为 float32 计算
+    // --- 数据类型统一为 float32 ---
     auto original_dtype = A.scalar_type();
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
@@ -94,10 +93,9 @@ torch::Tensor gemv_bang(
         B_fp32 = B.to(torch::kFloat);
     }
 
-    // 分配输出张量
     auto C_fp32 = torch::empty({M, 1}, A_fp32.options());
 
-    // 设置核心参数并启动 kernel
+    // --- 启动 MLU 核心 ---
     cnrtQueue_t queue = nullptr;
     cnrtDim3_t dim = {4, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
@@ -109,7 +107,7 @@ torch::Tensor gemv_bang(
         static_cast<int>(M),
         static_cast<int>(K));
 
-    // 转回原始数据类型
+    // --- 转回原始数据类型 ---
     if (original_dtype != torch::kFloat) {
         return C_fp32.to(original_dtype);
     }
