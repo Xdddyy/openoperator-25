@@ -1,8 +1,8 @@
-// 110_Gather_rows v110_74_parallel_d2h
-// v71 的进阶版：D2H index 和 D2H input 并行发起，用两个独立 cnrtQueue
-// CNRT 支持同时发起多个 memcpy，硬件层面可以重叠
-// 加上 row-interleaved gather（与 v66b 相同）
-#warning "BUILD_VERSION v110_74_parallel_d2h"
+// 110_Gather_rows v110_75_minimal_d2h
+// 策略：只 D2H index（16KB），input/output 留在 GDRAM
+// MLU kernel 直接从 GDRAM gather，不做 input D2H
+// 验证：如果 __gather 从 GDRAM 直接读比 D2H+CPU读更快，就是正确方向
+#warning "BUILD_VERSION v110_75_minimal_d2h"
 
 #include <bang.h>
 #include <torch/extension.h>
@@ -14,38 +14,55 @@
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
+#define TOTAL_K  (BATCH * K_COL)  // 2048 elements
 
-static uint16_t *g_in;
 static  int64_t *g_idx;
-static uint16_t *g_out;
 static bool g_init = false;
-static cnrtQueue_t g_q0;
-static cnrtQueue_t g_q1;
 
 static void ensure_init(void) {
     if (g_init) return;
-    if (posix_memalign((void**)&g_in,  4096, BATCH * N_COL * sizeof(uint16_t)) != 0) g_in  = nullptr;
     if (posix_memalign((void**)&g_idx, 4096, BATCH * K_COL * sizeof(int64_t)) != 0) g_idx = nullptr;
-    if (posix_memalign((void**)&g_out, 4096, BATCH * K_COL * sizeof(uint16_t)) != 0) g_out = nullptr;
-
-    // 创建两个独立 stream queue
-    cnrtQueueCreate(&g_q0);
-    cnrtQueueCreate(&g_q1);
-
     g_init = true;
 }
 
-static inline void gather8_interleave(
-    const uint16_t * in_base[8],
-    const  int64_t * idx_base[8],
-    uint16_t * out_base[8]
+__mlu_entry__ void gather_kernel(
+    const uint16_t *input,  // GDRAM
+    const int64_t  *idx,   // passed from host (g_idx in NRAM)
+    uint16_t *output        // GDRAM
 ) {
-    for (int k = 0; k < K_COL; ++k) {
-        #pragma GCC unroll 8
-        for (int r = 0; r < 8; ++r) {
-            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
+    if (taskId != 0) return;
+
+    // NRAM buffers
+    __nram__ unsigned short off[TOTAL_K];
+    __nram__ uint16_t nram_idx[TOTAL_K];
+    __nram__ uint16_t nram_out[TOTAL_K];
+
+    // Copy index from param to NRAM (param is already in NRAM/g_idx)
+    // Since idx is passed as NRAM pointer (g_idx), just cast
+    for (int i = 0; i < TOTAL_K; ++i) {
+        nram_idx[i] = (unsigned short)idx[i];
+    }
+
+    // Build offset table in NRAM
+    for (int b = 0; b < BATCH; ++b) {
+        int base = b * K_COL;
+        int row  = b * N_COL;
+        for (int k = 0; k < K_COL; ++k) {
+            off[base + k] = (unsigned short)(row + (int)nram_idx[base + k]);
         }
     }
+
+    // __gather: read from GDRAM input, scatter to NRAM
+    __gather(nram_out,
+             input,
+             off,
+             sizeof(uint16_t),
+             NRAM2NRAM,
+             GDRAM2NRAM,
+             TOTAL_K);
+
+    // NRAM → GDRAM output
+    __memcpy(output, nram_out, TOTAL_K * sizeof(uint16_t), NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor input,
@@ -53,41 +70,24 @@ torch::Tensor bang_func(torch::Tensor input,
     auto output = torch::empty({BATCH, K_COL}, input.options());
     ensure_init();
 
-    // 同一时刻发起两个 D2H（并行传输 index + input）
-    cnrtMemcpyAsync(g_idx,
-                    index.data_ptr<int64_t>(),
-                    BATCH * K_COL * sizeof(int64_t),
-                    CNRT_MEM_TRANS_DIR_DEV2HOST,
-                    g_q0);
+    // Only D2H index (16KB) — minimal transfer
+    cnrtMemcpy(g_idx,
+               index.data_ptr<int64_t>(),
+               BATCH * K_COL * sizeof(int64_t),
+               CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    cnrtMemcpyAsync(g_in,
-                    input.data_ptr(),
-                    BATCH * N_COL * sizeof(uint16_t),
-                    CNRT_MEM_TRANS_DIR_DEV2HOST,
-                    g_q1);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    // 等两个 queue 都完成
-    cnrtQueueWait(g_q0);
-    cnrtQueueWait(g_q1);
+    // Pass GDRAM input pointer, NRAM index pointer
+    gather_kernel<<<dim, ktype, queue>>>(
+        (const uint16_t*)input.data_ptr(),  // GDRAM (MLU reads directly)
+        g_idx,                              // NRAM (host-copied)
+        (uint16_t*)output.data_ptr()         // GDRAM
+    );
 
-    for (int g = 0; g < BATCH; g += 8) {
-        const uint16_t *in_ptrs[8];
-        const  int64_t *idx_ptrs[8];
-        uint16_t *out_ptrs[8];
-        for (int r = 0; r < 8; ++r) {
-            in_ptrs[r]  = g_in  + (g + r) * N_COL;
-            idx_ptrs[r] = g_idx + (g + r) * K_COL;
-            out_ptrs[r] = g_out + (g + r) * K_COL;
-        }
-        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
-    }
-
-    cnrtMemcpy(output.data_ptr(),
-               g_out,
-               BATCH * K_COL * sizeof(uint16_t),
-               CNRT_MEM_TRANS_DIR_HOST2DEV);
-
-    fprintf(stderr, "[V74] parallel D2H via cnrtQueue\n");
+    fprintf(stderr, "[V75] minimal D2H (index only), MLU gather from GDRAM\n");
     fflush(stderr);
 
     return output;
