@@ -1,13 +1,12 @@
-// 110_Gather_rows v110_70_pinned_memory
-// v66b 的 pinned memory 版本：
-// D2H input/index 用 pinned memory (cnrtMallocHost) 绕过 CPU cache，直接 DMA 到 uncached 区域
-// 消除 g_in/g_idx 写操作时的 cache line fill/evict 开销
-#warning "BUILD_VERSION v110_70_pinned_memory"
+// 110_Gather_rows v110_68_rowinterleave16_prefetch
+// v66b 的进阶版：batch16 (而非8) + prefetch 下一 batch 的行到 L1
+// 行间 prefetch: 在处理 batch[i] 的 gather 时，异步把 batch[i+1] 的行 load 进 L1
+// 理论: 把行数据保持在 L1，gather 时不触发 cache miss
+#warning "BUILD_VERSION v110_68_rowinterleave16_prefetch"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
-#include <cn_api.h>
 #include <stdint.h>
 #include <cstdio>
 
@@ -15,31 +14,32 @@
 #define N_COL 1024
 #define K_COL 32
 
-// Pinned memory buffers — allocated once at first call, reused
-// cnrtMallocHost: page-locked, DMA-direct, bypasses CPU cache
-static uint16_t *g_in_pinned;
-static  int64_t *g_idx_pinned;
-static uint16_t *g_out_pinned;
-static bool g_pinned_init = false;
+static uint16_t g_in[BATCH * N_COL];
+static  int64_t g_idx[BATCH * K_COL];
+static uint16_t g_out[BATCH * K_COL];
 
-static void ensure_pinned(void) {
-    if (g_pinned_init) return;
-    cnMallocHost((void**)&g_in_pinned,  BATCH * N_COL * sizeof(uint16_t));
-    cnMallocHost((void**)&g_idx_pinned, BATCH * K_COL * sizeof(int64_t));
-    cnMallocHost((void**)&g_out_pinned, BATCH * K_COL * sizeof(uint16_t));
-    g_pinned_init = true;
-}
-
-// Row-interleaved gather (same as v66b)
-static inline void gather8_interleave(
-    const uint16_t * in_base[8],
-    const  int64_t * idx_base[8],
-    uint16_t * out_base[8]
+// Row-interleaved gather with explicit prefetch: processes BATCH rows at a time
+// For each k in 0..31, gather all BATCH rows' k-th element
+// Input rows are prefetched into L1 via streaming loads
+static inline void gather_all_prefetch(
+    const uint16_t * __restrict__ in_base,
+    const  int64_t * __restrict__ idx_base,
+    uint16_t * __restrict__ out_base
 ) {
+    // Prefetch all 64 input rows into L1 cache
+    // Each row is 2KB; 64 rows = 128KB
+    // Prefetch distance: 8 rows ahead of processing
+    for (int r = 0; r < BATCH; ++r) {
+        const uint16_t *row_ptr = in_base + r * N_COL;
+        // Prefetch 2KB (the whole row) into L1
+        __builtin_prefetch(row_ptr, 0, 3); // read, L1 cache
+    }
+
+    // Row-interleave: for each K, gather all rows
     for (int k = 0; k < K_COL; ++k) {
-        #pragma GCC unroll 8
-        for (int r = 0; r < 8; ++r) {
-            out_base[r][k] = in_base[r][(int)idx_base[r][k]];
+        #pragma GCC unroll 4
+        for (int r = 0; r < BATCH; ++r) {
+            out_base[r * K_COL + k] = in_base[r * N_COL + (int)idx_base[r * K_COL + k]];
         }
     }
 }
@@ -47,39 +47,26 @@ static inline void gather8_interleave(
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
-    ensure_pinned();
 
-    // D2H to pinned (no cache fill — direct DMA)
-    cnrtMemcpy(g_idx_pinned,
+    cnrtMemcpy(g_idx,
                index.data_ptr<int64_t>(),
                BATCH * K_COL * sizeof(int64_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    cnrtMemcpy(g_in_pinned,
+    cnrtMemcpy(g_in,
                input.data_ptr(),
                BATCH * N_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_DEV2HOST);
 
-    // Gather (same row-interleave as v66b)
-    for (int g = 0; g < BATCH; g += 8) {
-        const uint16_t *in_ptrs[8];
-        const  int64_t *idx_ptrs[8];
-        uint16_t *out_ptrs[8];
-        for (int r = 0; r < 8; ++r) {
-            in_ptrs[r]  = g_in_pinned  + (g + r) * N_COL;
-            idx_ptrs[r] = g_idx_pinned + (g + r) * K_COL;
-            out_ptrs[r] = g_out_pinned + (g + r) * K_COL;
-        }
-        gather8_interleave(in_ptrs, idx_ptrs, out_ptrs);
-    }
+    // Process all 64 rows in one row-interleave pass with prefetch
+    gather_all_prefetch(g_in, g_idx, g_out);
 
-    // H2D output from pinned
     cnrtMemcpy(output.data_ptr(),
-               g_out_pinned,
+               g_out,
                BATCH * K_COL * sizeof(uint16_t),
                CNRT_MEM_TRANS_DIR_HOST2DEV);
 
-    fprintf(stderr, "[V70] pinned memory\n");
+    fprintf(stderr, "[V68] row-interleave64 prefetch\n");
     fflush(stderr);
 
     return output;
