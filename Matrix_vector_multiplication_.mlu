@@ -3,13 +3,13 @@
 #include <cnrt.h>
 #include <algorithm>
 
-#define CHUNK_SIZE 4096   // 每次处理的 K 维度分块大小，可调
+#define CHUNK_SIZE 4096
 
 // ==================== MLU 内核函数 ====================
 __mlu_entry__ void gemv_kernel(
-    float *A,     // 输入矩阵 [M, K]
-    float *B,     // 输入向量 [K]
-    float *C,     // 输出向量 [M]
+    float *A,
+    float *B,
+    float *C,
     int M,
     int K) {
 
@@ -27,23 +27,28 @@ __mlu_entry__ void gemv_kernel(
     __nram__ float nram_b[CHUNK_SIZE] __attribute__((aligned(64)));
     __nram__ float nram_a[CHUNK_SIZE] __attribute__((aligned(64)));
     __nram__ float nram_mul[CHUNK_SIZE] __attribute__((aligned(64)));
-    __nram__ float nram_sum[CHUNK_SIZE] __attribute__((aligned(64)));   // 存储每行部分和
+    __nram__ float nram_sum[CHUNK_SIZE] __attribute__((aligned(64)));
+
+    // 循环控制变量（提前声明）
+    int k, len, aligned_len;
+    uint32_t i, row;
+    int cur_len, half;          // 归约辅助变量
 
     // 初始化各行累加器为 0
     __bang_write_zero(nram_sum, count_row);
 
     // 外层循环：遍历 K 分块，每个 B 分块只加载一次，被所有行复用
-    for (int k = 0; k < K; k += CHUNK_SIZE) {
-        int len = std::min(CHUNK_SIZE, K - k);
-        int aligned_len = (len + 15) / 16 * 16;   // 按 16 个 float 对齐（64字节）
+    for (k = 0; k < K; k += CHUNK_SIZE) {
+        len = std::min(CHUNK_SIZE, K - k);
+        aligned_len = (len + 15) / 16 * 16;   // 64字节对齐（16个float）
 
         // 加载 B 分块
         __bang_write_zero(nram_b, aligned_len);
         __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
         // 内层循环：处理当前 B 分块对应的所有行
-        for (uint32_t i = 0; i < count_row; ++i) {
-            uint32_t row = start_row + i;
+        for (i = 0; i < count_row; ++i) {
+            row = start_row + i;
             // 加载 A 的当前行片段
             __bang_write_zero(nram_a, aligned_len);
             __memcpy(nram_a, A + row * K + k, len * sizeof(float), GDRAM2NRAM);
@@ -52,26 +57,26 @@ __mlu_entry__ void gemv_kernel(
             __bang_mul(nram_mul, nram_a, nram_b, aligned_len);
 
             // ---------- 正确归约（处理任意长度） ----------
-            int cur_len = len;
+            cur_len = len;
             while (cur_len > 1) {
                 // 若长度为奇数，将最后一个元素累加到 nram_mul[0]
                 if (cur_len & 1) {
                     nram_mul[0] += nram_mul[cur_len - 1];
                     cur_len--;
                 }
-                int half = cur_len / 2;
+                half = cur_len / 2;
                 __bang_add(nram_mul, nram_mul, nram_mul + half, half);
                 cur_len = half;
             }
             // 此时 nram_mul[0] 为当前分块的和
 
-            // 累加到该行的总和中
+            // 累加到该行的总和中（长度为1的向量加法）
             __bang_add(nram_sum + i, nram_sum + i, nram_mul, 1);
         }
     }
 
     // 写回结果
-    for (uint32_t i = 0; i < count_row; ++i) {
+    for (i = 0; i < count_row; ++i) {
         __memcpy(C + start_row + i, nram_sum + i, sizeof(float), NRAM2GDRAM);
     }
 }
@@ -121,7 +126,7 @@ torch::Tensor bang_func(
         static_cast<int>(M),
         static_cast<int>(K));
 
-    // 同步等待（可选，确保结果可用）
+    // 同步等待（确保结果可用）
     cnrtQueueSync(queue);
 
     // 转回原始数据类型（若需要）
@@ -130,8 +135,3 @@ torch::Tensor bang_func(
     }
     return C_fp32;
 }
-
-// 绑定模块（若需要单独编译为 .so，可添加以下宏）
-// TORCH_LIBRARY(matrix_vector_multiplication, m) {
-//     m.def("bang_func", bang_func);
-// }
