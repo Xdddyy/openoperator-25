@@ -1,97 +1,75 @@
-// 110_Gather_rows v110_64_parallel_gather
-// 基于 v63b，8 线程并行：
-// - 每个线程独立 D2H 拉自己的 8 行 input (每线程 16KB)
-// - 同时独立 D2H 拉自己的 8*32 index (每线程 2KB)
-// - 然后 gather，写到 g_out 对应位置
-// 关键：8 路并发 D2H 重叠 PCI-e 延迟
-#warning "BUILD_VERSION v110_64_parallel_gather"
+// 110_Gather_rows v110_65_mlu_gather_batch_v3
+// 设备侧 gather：NRAM 局部缓冲区 + __gather 批量
+// 去掉 __nram__ 参数修饰，offset 用元素单位
+#warning "BUILD_VERSION v110_65_mlu_gather_batch_v3"
 
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
 #include <stdint.h>
 #include <cstdio>
-#include <thread>
-#include <vector>
-#include <atomic>
 
 #define BATCH 64
 #define N_COL 1024
 #define K_COL 32
-#define NUM_THREADS 8
-#define ROWS_PER_T (BATCH / NUM_THREADS)   // 8
+#define TOTAL_IN   (BATCH * N_COL)    // 65536 half
+#define TOTAL_IDX  (BATCH * K_COL)     // 2048 int64
+#define TOTAL_OUT  (BATCH * K_COL)     // 2048 half
 
-// output buffer (最终 H2D)
-static uint16_t g_out[BATCH * K_COL];
-
-// 每线程本地 input/index buffers (避免 false sharing，对齐到 64B)
-alignas(64) static uint16_t g_in_t[NUM_THREADS][ROWS_PER_T * N_COL];
-alignas(64) static  int64_t g_idx_t[NUM_THREADS][ROWS_PER_T * K_COL];
-
-static inline void gather_row(
-    const uint16_t * __restrict__ in_row,
-    const int64_t * __restrict__ idx_row,
-    uint16_t * __restrict__ out_row
+__mlu_entry__ void gather_batch_kernel(
+    const uint16_t *input,   // GDRAM base pointer
+    const int64_t  *index,  // GDRAM index pointer
+    uint16_t *output         // GDRAM output pointer
 ) {
-    for (int k = 0; k < K_COL; ++k) {
-        out_row[k] = in_row[(int)idx_row[k]];
+    if (taskId != 0) return;
+
+    __nram__ uint16_t nram_out[TOTAL_OUT];
+    __nram__ unsigned short nram_off[TOTAL_OUT];
+
+    // Build offset table: element offsets (NOT byte offsets)
+    // For row b, element k: offset = b*N_COL + index[b*K_COL + k]
+    for (int b = 0; b < BATCH; ++b) {
+        int idx_base = b * K_COL;
+        int row_base = b * N_COL;
+        for (int k = 0; k < K_COL; ++k) {
+            int idx = (int)index[idx_base + k];
+            nram_off[idx_base + k] = (unsigned short)(row_base + idx);
+        }
     }
-}
 
-// 单线程：拉自己的行 + gather
-static void worker(
-    int tid,
-    const uint16_t *in_dev_ptr,
-    const int64_t  *idx_dev_ptr
-) {
-    int row_start = tid * ROWS_PER_T;
-    uint16_t *local_in  = g_in_t[tid];
-    int64_t  *local_idx = g_idx_t[tid];
-    uint16_t *out = g_out + row_start * K_COL;
+    // __gather: dst=nram_out, src=input[GDRAM], offsets=nram_off
+    // elem_size=sizeof(uint16_t)=2 bytes per half
+    // gdrammode=GDRAM2NRAM: reading from GDRAM, writing to NRAM
+    __gather(nram_out,
+             input,
+             nram_off,
+             sizeof(uint16_t),
+             NRAM2NRAM,
+             GDRAM2NRAM,
+             TOTAL_OUT);
 
-    // D2H: input rows
-    cnrtMemcpy(local_in,
-               (void*)(in_dev_ptr + row_start * N_COL),
-               ROWS_PER_T * N_COL * sizeof(uint16_t),
-               CNRT_MEM_TRANS_DIR_DEV2HOST);
-
-    // D2H: index rows
-    cnrtMemcpy(local_idx,
-               (void*)(idx_dev_ptr + row_start * K_COL),
-               ROWS_PER_T * K_COL * sizeof(int64_t),
-               CNRT_MEM_TRANS_DIR_DEV2HOST);
-
-    // gather
-    for (int r = 0; r < ROWS_PER_T; ++r) {
-        gather_row(local_in + r * N_COL,
-                   local_idx + r * K_COL,
-                   out + r * K_COL);
-    }
+    // NRAM → GDRAM output
+    __memcpy(output,
+             nram_out,
+             TOTAL_OUT * sizeof(uint16_t),
+             NRAM2GDRAM);
 }
 
 torch::Tensor bang_func(torch::Tensor input,
                         torch::Tensor index) {
     auto output = torch::empty({BATCH, K_COL}, input.options());
 
-    const uint16_t *in_dev  = (const uint16_t*)input.data_ptr();
-    const int64_t  *idx_dev = index.data_ptr<int64_t>();
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
 
-    // 8 线程并行
-    std::vector<std::thread> threads;
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        threads.emplace_back(worker, t, in_dev, idx_dev);
-    }
-    for (auto &th : threads) {
-        th.join();
-    }
+    gather_batch_kernel<<<dim, ktype, queue>>>(
+        (const uint16_t*)input.data_ptr(),
+        index.data_ptr<int64_t>(),
+        (uint16_t*)output.data_ptr()
+    );
 
-    // H2D output
-    cnrtMemcpy(output.data_ptr(),
-               g_out,
-               BATCH * K_COL * sizeof(uint16_t),
-               CNRT_MEM_TRANS_DIR_HOST2DEV);
-
-    fprintf(stderr, "[V64] parallel x%d\n", NUM_THREADS);
+    fprintf(stderr, "[V65] MLU batch gather\n");
     fflush(stderr);
 
     return output;
