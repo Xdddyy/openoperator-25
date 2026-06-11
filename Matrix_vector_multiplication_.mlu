@@ -12,7 +12,7 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    // --- 多核拆分 M 行 ---
+    // 多核拆分 M 行
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
     uint32_t per_core = M / core_num;
@@ -27,38 +27,38 @@ __mlu_entry__ void gemv_kernel(
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
     __nram__ float nram_mul[CHUNK_SIZE];
+    __nram__ float nram_sum[1];       // 归约结果向量
     __nram__ float nram_out;
 
-    // 遍历负责的所有行
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
-        float accumulator = 0.0f;
+        float accum = 0.0f;
 
         // 沿 K 方向分块计算点积
         for (uint32_t k = 0; k < K; k += CHUNK_SIZE) {
             uint32_t len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
-            // 使用 64 字节对齐（参考代码风格），但累加时只用实际长度
-            uint32_t aligned_len = (len + 63) & ~63;
+            // 对齐到 16 个 float（64 字节），BANG 指令要求
+            uint32_t aligned_len = (len + 15) & ~15;
 
-            // 1. 清零并搬运 B 片段
+            // 加载 B 片段（多余部分已清零）
             __bang_write_zero(nram_b, aligned_len);
             __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 2. 清零并搬运 A 行片段
+            // 加载 A 当前行对应片段
             __bang_write_zero(nram_a, aligned_len);
             __memcpy(nram_a, A + row * K + k, len * sizeof(float), GDRAM2NRAM);
 
-            // 3. 逐元素乘法
+            // 逐元素乘法
             __bang_mul(nram_mul, nram_a, nram_b, aligned_len);
 
-            // 4. 标量循环累加实际有效元素（避免使用 reduce_sum）
-            for (uint32_t t = 0; t < len; ++t) {
-                accumulator += nram_mul[t];
-            }
+            // 归约求和，结果放入 nram_sum[0]
+            __bang_reduce_sum(nram_sum, nram_mul, aligned_len);
+
+            accum += nram_sum[0];
         }
 
-        // 将结果写回全局内存
-        nram_out = accumulator;
+        // 写回结果
+        nram_out = accum;
         __memcpy(C + row, &nram_out, sizeof(float), NRAM2GDRAM);
     }
 }
@@ -68,7 +68,6 @@ torch::Tensor bang_func(
     torch::Tensor A,
     torch::Tensor B) {
 
-    // 输入检查
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be a 2D matrix");
@@ -85,7 +84,7 @@ torch::Tensor bang_func(
         TORCH_CHECK(B.size(0) == K, "B length must be K");
     }
 
-    // 数据类型统一为 float32
+    // 统一转为 float32
     auto original_dtype = A.scalar_type();
     torch::Tensor A_fp32 = A;
     torch::Tensor B_fp32 = B;
@@ -108,7 +107,6 @@ torch::Tensor bang_func(
         static_cast<int>(M),
         static_cast<int>(K));
 
-    // 转回原始数据类型
     if (original_dtype != torch::kFloat) {
         return C_fp32.to(original_dtype);
     }
