@@ -44,7 +44,8 @@ __mlu_entry__ void gather_kernel(
     }
 
     // 7 参数：dst, src, offset, elem_size, dir_A, dir_B, count
-    __gather(nram_out, input, off, 2, NRAM2NRAM, GDRAM2NRAM, TOTAL_K);
+    // GDRAM2NRAM=0 -> NRAM2NRAM 作为 dst direction
+    __gather(nram_out, input, off, 2, NRAM2NRAM, NRAM2NRAM, TOTAL_K);
 
     __memcpy(output, nram_out, TOTAL_K * 2, NRAM2GDRAM);
 }
@@ -66,14 +67,15 @@ torch::Tensor bang_func(torch::Tensor input,
     cnrtDim3_t dim = {1, 1, 1};
     cnrtFunctionType_t ktype = CNRT_FUNC_TYPE_BLOCK;
 
-    CNRT_CHECK(cnrtLaunchKernel(gather_kernel,
-                                dim.x, dim.y, dim.z,
-                                nullptr, 0,
-                                queue,
-                                ktype,
-                                (void*)input_cont.data_ptr(),
-                                (void*)g_idx,
-                                (void*)output_cont.data_ptr()));
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    cnrtDim3_t dim = {1, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    gather_kernel<<<dim, ktype, queue>>>(
+        (const uint16_t*)input_cont.data_ptr(),
+        g_idx,
+        (uint16_t*)output_cont.data_ptr()
+    );
 
     cnrtQueueSync(queue);
 
