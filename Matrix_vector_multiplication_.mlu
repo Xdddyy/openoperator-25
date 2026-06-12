@@ -2,7 +2,10 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define NRAM_BUF 512
+// 每次树状归约的块大小，必须是2的幂
+#define BLOCK  1024
+// NRAM 分配两个 BLOCK 大小的缓冲区
+#define NRAM_SIZE 1024
 
 __mlu_entry__ void gemv_kernel(
     float* A,
@@ -23,38 +26,47 @@ __mlu_entry__ void gemv_kernel(
     if (count_row == 0) return;
     if (start_row >= (uint32_t)M) return;
 
-    __nram__ float nram_a[NRAM_BUF];
-    __nram__ float nram_b[NRAM_BUF];
-    __nram__ float nram_mul[NRAM_BUF];
+    __nram__ float nram_a[NRAM_SIZE];
+    __nram__ float nram_b[NRAM_SIZE];
+    __nram__ float nram_mul[NRAM_SIZE];
 
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
+
+        // 用两级累加：
+        // 第一级：每 BLOCK 个元素做树状归约，得到一个局部和 partial
+        // 第二级：把所有 partial 累加成最终结果
+        // 树状归约误差是 O(log BLOCK)，远小于线性累加的 O(K)
+
         float acc = 0.0f;
 
-        uint32_t k = 0;
-        while (k < (uint32_t)K) {
-            uint32_t len = ((k + NRAM_BUF) <= (uint32_t)K)
-                           ? (uint32_t)NRAM_BUF
+        for (uint32_t k = 0; k < (uint32_t)K; k += NRAM_SIZE) {
+            uint32_t len = ((k + NRAM_SIZE) <= (uint32_t)K)
+                           ? (uint32_t)NRAM_SIZE
                            : ((uint32_t)K - k);
 
-            // 清零整个缓冲区
-            __bang_write_zero(nram_a,   NRAM_BUF);
-            __bang_write_zero(nram_b,   NRAM_BUF);
-            __bang_write_zero(nram_mul, NRAM_BUF);
+            // 清零整个缓冲区，保证多余位置是 0
+            __bang_write_zero(nram_a,   NRAM_SIZE);
+            __bang_write_zero(nram_b,   NRAM_SIZE);
+            __bang_write_zero(nram_mul, NRAM_SIZE);
 
-            // 只拷贝有效部分
             __memcpy(nram_a, A + row * (uint32_t)K + k, len * sizeof(float), GDRAM2NRAM);
             __memcpy(nram_b, B + k,                      len * sizeof(float), GDRAM2NRAM);
 
-            // 乘法，对全部 NRAM_BUF 做（多余部分是 0*0=0）
-            __bang_mul(nram_mul, nram_a, nram_b, NRAM_BUF);
+            // 逐元素乘
+            __bang_mul(nram_mul, nram_a, nram_b, NRAM_SIZE);
 
-            // 简单逐元素累加，只累加有效的 len 个
-            for (uint32_t idx = 0; idx < len; ++idx) {
-                acc += nram_mul[idx];
+            // 对 NRAM_SIZE 个元素做完整树状归约
+            // 多余部分已是 0，不影响结果
+            uint32_t step = NRAM_SIZE;
+            while (step > 1) {
+                uint32_t s2 = step / 2;
+                // dst=前半, src1=前半, src2=后半, count=s2
+                __bang_add(nram_mul, nram_mul, nram_mul + s2, s2);
+                step = s2;
             }
-
-            k += len;
+            // nram_mul[0] 是本块 NRAM_SIZE 个乘积的精确和
+            acc += nram_mul[0];
         }
 
         __nram__ float nram_result[1];
