@@ -1,6 +1,7 @@
 #include <bang.h>
 #include <torch/extension.h>
 #include <cnrt.h>
+#include "framework/core/MLUStream.h"
 
 #define CHUNK_SIZE 4096
 
@@ -66,13 +67,11 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     auto B_flat  = (B.dim() == 2) ? B.view({B.size(0)}) : B;
     auto B_fp32  = (B.scalar_type() == torch::kFloat) ? B_flat : B_flat.to(torch::kFloat);
 
-    // 关键 1：输出形状必须是 (M, 1)，与 PyTorch 参考一致
-    // 关键 2：用 zeros 而不是 empty，避免未写入的位置出现垃圾值
+    // 输出 (M, 1)，用 zeros 防止未写入位置含垃圾值
     auto C_fp32 = torch::zeros({M, 1}, A_fp32.options());
 
-    // 关键 3：创建实际的 queue，并在 kernel 后显式同步
-    cnrtQueue_t queue = nullptr;
-    cnrtQueueCreate(&queue);
+    // 使用 PyTorch 当前的 MLU 队列，不要自己创建
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream().stream();
 
     unsigned int num_cores = (M >= 4) ? 4 : 1;
     cnrtDim3_t dim = {num_cores, 1, 1};
@@ -86,9 +85,8 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         (int)K
     );
 
-    // 等 kernel 跑完再返回，避免 PyTorch 读到未完成的结果
+    // 同步当前 stream，确保 kernel 完成后再返回
     cnrtQueueSync(queue);
-    cnrtQueueDestroy(queue);
 
     if (A.scalar_type() != torch::kFloat) {
         return C_fp32.to(A.scalar_type());
