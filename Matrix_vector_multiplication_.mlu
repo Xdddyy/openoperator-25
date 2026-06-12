@@ -2,9 +2,7 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-// 每次归约的块大小，越小误差越小
-#define CHUNK_SIZE 128
-#define NRAM_BUF   128
+#define NRAM_BUF 512
 
 __mlu_entry__ void gemv_kernel(
     float* A,
@@ -33,37 +31,30 @@ __mlu_entry__ void gemv_kernel(
         uint32_t row = start_row + i;
         float acc = 0.0f;
 
-        for (uint32_t k = 0; k < (uint32_t)K; k += CHUNK_SIZE) {
-            uint32_t len = ((k + CHUNK_SIZE) <= (uint32_t)K)
-                           ? (uint32_t)CHUNK_SIZE
+        uint32_t k = 0;
+        while (k < (uint32_t)K) {
+            uint32_t len = ((k + NRAM_BUF) <= (uint32_t)K)
+                           ? (uint32_t)NRAM_BUF
                            : ((uint32_t)K - k);
 
-            // 清零
-            __bang_write_zero(nram_a, NRAM_BUF);
-            __bang_write_zero(nram_b, NRAM_BUF);
+            // 清零整个缓冲区
+            __bang_write_zero(nram_a,   NRAM_BUF);
+            __bang_write_zero(nram_b,   NRAM_BUF);
+            __bang_write_zero(nram_mul, NRAM_BUF);
 
-            // 加载数据
+            // 只拷贝有效部分
             __memcpy(nram_a, A + row * (uint32_t)K + k, len * sizeof(float), GDRAM2NRAM);
             __memcpy(nram_b, B + k,                      len * sizeof(float), GDRAM2NRAM);
 
-            // 逐元素乘
+            // 乘法，对全部 NRAM_BUF 做（多余部分是 0*0=0）
             __bang_mul(nram_mul, nram_a, nram_b, NRAM_BUF);
 
-            // 对本块做树状归约，只归约有效的 len 个元素
-            // 先把有效长度对齐到2的幂次
-            uint32_t rlen = 1;
-            while (rlen < len) rlen <<= 1;
-            // 超出 len 的部分已经是 0（__bang_write_zero 保证），不影响结果
-
-            // 树状归约
-            uint32_t step = rlen;
-            while (step > 1) {
-                uint32_t s2 = step / 2;
-                __bang_add(nram_mul, nram_mul, nram_mul + s2, s2);
-                step = s2;
+            // 简单逐元素累加，只累加有效的 len 个
+            for (uint32_t idx = 0; idx < len; ++idx) {
+                acc += nram_mul[idx];
             }
 
-            acc += nram_mul[0];
+            k += len;
         }
 
         __nram__ float nram_result[1];
@@ -76,15 +67,16 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be 2D");
-    TORCH_CHECK(B.dim() == 1 || (B.dim() == 2 && B.size(1) == 1), "B must be 1D or (K,1)");
+    TORCH_CHECK(B.dim() == 1 || (B.dim() == 2 && B.size(1) == 1),
+                "B must be 1D or (K,1)");
     TORCH_CHECK(B.size(0) == A.size(1), "B length must match K");
 
     int64_t M = A.size(0);
     int64_t K = A.size(1);
 
     auto A_fp32 = (A.scalar_type() == torch::kFloat) ? A : A.to(torch::kFloat);
-    auto B_flat  = (B.dim() == 2) ? B.view({B.size(0)}) : B;
-    auto B_fp32  = (B.scalar_type() == torch::kFloat) ? B_flat : B_flat.to(torch::kFloat);
+    auto B_flat = (B.dim() == 2) ? B.view({B.size(0)}) : B;
+    auto B_fp32 = (B.scalar_type() == torch::kFloat) ? B_flat : B_flat.to(torch::kFloat);
 
     auto C_fp32 = torch::zeros({M, 1}, A_fp32.options());
 
