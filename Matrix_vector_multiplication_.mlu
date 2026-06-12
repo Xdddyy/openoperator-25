@@ -23,13 +23,9 @@ __mlu_entry__ void gemv_kernel(
     if (count_row == 0) return;
     if (start_row >= (uint32_t)M) return;
 
-    // float32 缓冲区
     __nram__ float nram_a[NRAM_SIZE];
     __nram__ float nram_b[NRAM_SIZE];
     __nram__ float nram_mul[NRAM_SIZE];
-    // bfloat16 缓冲区，存放转换后的数据（bfloat16 占 2 字节，float32 占 4 字节）
-    __nram__ int16_t nram_a_bf16[NRAM_SIZE];
-    __nram__ int16_t nram_b_bf16[NRAM_SIZE];
 
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
@@ -44,19 +40,9 @@ __mlu_entry__ void gemv_kernel(
             __bang_write_zero(nram_b,   NRAM_SIZE);
             __bang_write_zero(nram_mul, NRAM_SIZE);
 
-            // 加载 float32 数据
             __memcpy(nram_a, A + row * (uint32_t)K + k, len * sizeof(float), GDRAM2NRAM);
             __memcpy(nram_b, B + k,                      len * sizeof(float), GDRAM2NRAM);
 
-            // float32 -> bfloat16，对齐参考实现的精度路径
-            __bang_float2bfloat16_rn((uint16_t*)nram_a_bf16, nram_a, NRAM_SIZE);
-            __bang_float2bfloat16_rn((uint16_t*)nram_b_bf16, nram_b, NRAM_SIZE);
-
-            // bfloat16 -> float32，再做乘法
-            __bang_bfloat162float(nram_a, (uint16_t*)nram_a_bf16, NRAM_SIZE);
-            __bang_bfloat162float(nram_b, (uint16_t*)nram_b_bf16, NRAM_SIZE);
-
-            // 乘法
             __bang_mul(nram_mul, nram_a, nram_b, NRAM_SIZE);
 
             // 树状归约
@@ -86,11 +72,14 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     int64_t M = A.size(0);
     int64_t K = A.size(1);
 
-    auto A_fp32 = (A.scalar_type() == torch::kFloat) ? A : A.to(torch::kFloat);
-    auto B_flat = (B.dim() == 2) ? B.view({B.size(0)}) : B;
-    auto B_fp32 = (B.scalar_type() == torch::kFloat) ? B_flat : B_flat.to(torch::kFloat);
+    // bfloat16 round-trip：对齐参考实现的精度路径
+    // 参考实现做了 randn().bfloat16().float()，matmul 内部也走 bfloat16 路径
+    // 这里显式做同样的 round-trip，让数值完全一致
+    auto A_bf16 = A.to(torch::kBFloat16).to(torch::kFloat).contiguous();
+    auto B_in   = (B.dim() == 2) ? B.view({B.size(0)}) : B;
+    auto B_bf16 = B_in.to(torch::kBFloat16).to(torch::kFloat).contiguous();
 
-    auto C_fp32 = torch::zeros({M, 1}, A_fp32.options());
+    auto C_fp32 = torch::zeros({M, 1}, A_bf16.options());
 
     unsigned int num_cores   = ((int64_t)M >= 4) ? 4 : 1;
     cnrtDim3_t dim           = {num_cores, 1, 1};
@@ -98,8 +87,8 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     cnrtQueue_t queue        = nullptr;
 
     gemv_kernel<<<dim, ktype, queue>>>(
-        A_fp32.data_ptr<float>(),
-        B_fp32.data_ptr<float>(),
+        A_bf16.data_ptr<float>(),
+        B_bf16.data_ptr<float>(),
         C_fp32.data_ptr<float>(),
         (int)M,
         (int)K
