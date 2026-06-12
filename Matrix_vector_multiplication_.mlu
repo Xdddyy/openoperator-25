@@ -26,13 +26,10 @@ __mlu_entry__ void gemv_kernel(
     __nram__ float nram_a[NRAM_SIZE];
     __nram__ float nram_b[NRAM_SIZE];
     __nram__ float nram_mul[NRAM_SIZE];
-    // 用于树状归约的临时缓冲区
-    __nram__ float nram_tmp[NRAM_SIZE];
 
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
 
-        // Neumaier 补偿累加，块间误差补偿
         float acc  = 0.0f;
         float comp = 0.0f;
 
@@ -48,21 +45,17 @@ __mlu_entry__ void gemv_kernel(
             __memcpy(nram_a, A + row * (uint32_t)K + k, len * sizeof(float), GDRAM2NRAM);
             __memcpy(nram_b, B + k,                      len * sizeof(float), GDRAM2NRAM);
 
-            // 逐元素乘，结果在 nram_mul
             __bang_mul(nram_mul, nram_a, nram_b, NRAM_SIZE);
 
-            // 树状归约：__bang_add(dst, src1, src2, count)
-            // 每轮把后半段加到前半段，步长减半
+            // 树状归约
             uint32_t step = NRAM_SIZE;
             while (step > 1) {
                 uint32_t s2 = step / 2;
-                // dst=nram_mul, src1=nram_mul, src2=nram_mul+s2, count=s2
                 __bang_add(nram_mul, nram_mul, nram_mul + s2, s2);
                 step = s2;
             }
-            // nram_mul[0] 是本块的局部和
 
-            // Neumaier 补偿累加，防止块间误差积累
+            // Neumaier 补偿
             float val     = nram_mul[0];
             float new_acc = acc + val;
             if (acc >= val && acc >= -val) {
@@ -90,21 +83,21 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     int64_t M = A.size(0);
     int64_t K = A.size(1);
 
-    auto A_fp32 = (A.scalar_type() == torch::kFloat) ? A : A.to(torch::kFloat);
-    auto B_flat = (B.dim() == 2) ? B.view({B.size(0)}) : B;
-    auto B_fp32 = (B.scalar_type() == torch::kFloat) ? B_flat : B_flat.to(torch::kFloat);
+    // 尝试 float16 round-trip，对齐 MLU matmul 内部精度路径
+    auto A_f16 = A.to(torch::kHalf).to(torch::kFloat).contiguous();
+    auto B_in  = (B.dim() == 2) ? B.view({B.size(0)}) : B;
+    auto B_f16 = B_in.to(torch::kHalf).to(torch::kFloat).contiguous();
 
-    auto C_fp32 = torch::zeros({M, 1}, A_fp32.options());
+    auto C_fp32 = torch::zeros({M, 1}, A_f16.options());
 
     unsigned int num_cores   = ((int64_t)M >= 4) ? 4 : 1;
     cnrtDim3_t dim           = {num_cores, 1, 1};
     cnrtFunctionType_t ktype = (num_cores == 4) ? cnrtFuncTypeUnion1 : cnrtFuncTypeBlock;
     cnrtQueue_t queue        = nullptr;
 
-    // 正确的三尖括号语法
     gemv_kernel<<<dim, ktype, queue>>>(
-        A_fp32.data_ptr<float>(),
-        B_fp32.data_ptr<float>(),
+        A_f16.data_ptr<float>(),
+        B_f16.data_ptr<float>(),
         C_fp32.data_ptr<float>(),
         (int)M,
         (int)K
