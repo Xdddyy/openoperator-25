@@ -40,12 +40,26 @@ __mlu_entry__ void gemv_kernel(
 
             __bang_mul(nram_mul, nram_a, nram_b, len);
 
-            // 使用 MLU 内置归约求和接口
-            float partial_sum = __bang_reduce_sum(nram_mul, len);
+            // 调用3参数版本__bang_reduce_sum，结果保存在nram_sum[0]
+            __bang_reduce_sum(nram_sum, nram_mul, len);
 
-            nram_sum[0] += partial_sum;
+            // 将本分块结果累加到nram_sum[0]
+            // 因为归约结果重写nram_sum，需要在循环外累加总和
+            // 所以采用临时变量累加策略：
+            // 这里每次重写nram_sum需先保存之前的和到临时变量，再累加
+            float temp_sum = nram_sum[0];
+
+            // 如果是整循环唯一累加，nram_sum[0]即为本轮和，否则自定义累加逻辑
+
+            // 为了正确累加所有分块，建议如下：
+            if (k == 0) {
+                // 第一次分块初始化nram_sum[0]
+                nram_sum[0] = temp_sum;
+            } else {
+                // 后续分块累加
+                nram_sum[0] += temp_sum;
+            }
         }
-
         __memcpy(C + row, nram_sum, sizeof(float), NRAM2GDRAM);
     }
 }
