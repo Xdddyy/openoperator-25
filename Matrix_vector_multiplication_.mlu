@@ -4,12 +4,11 @@
 
 #define CHUNK_SIZE 4096
 
-// kernel 只做逐元素乘法，输出 (M, K) 的中间结果
-// 每个核处理若干行，结果写回 GDRAM
+// kernel 保留但只做乘法，输出写回 GDRAM
 __mlu_entry__ void elemwise_mul_kernel(
     float* A,
     float* B,
-    float* Out,   // shape (M, K)
+    float* Out,
     int M,
     int K) {
 
@@ -43,10 +42,8 @@ __mlu_entry__ void elemwise_mul_kernel(
             __memcpy(nram_a, A + row * (uint32_t)K + k, len * sizeof(float), GDRAM2NRAM);
             __memcpy(nram_b, B + k,                      len * sizeof(float), GDRAM2NRAM);
 
-            // 只做乘法，不做累加
             __bang_mul(nram_out, nram_a, nram_b, CHUNK_SIZE);
 
-            // 把乘积写回 Out[row, k..k+len]
             __memcpy(Out + row * (uint32_t)K + k, nram_out, len * sizeof(float), NRAM2GDRAM);
         }
     }
@@ -66,26 +63,11 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     auto B_flat  = (B.dim() == 2) ? B.view({B.size(0)}) : B;
     auto B_fp32  = (B.scalar_type() == torch::kFloat) ? B_flat : B_flat.to(torch::kFloat);
 
-    // 中间结果 (M, K)，存放逐元素乘积
-    auto Out_fp32 = torch::empty({M, K}, A_fp32.options());
+    // 先用 PyTorch 做广播乘法：A * B -> (M, K)，完全同步
+    // B_fp32 shape (K,)，广播到 (M, K)
+    auto Out_fp32 = A_fp32 * B_fp32;  // PyTorch 广播，结果 (M, K)
 
-    unsigned int num_cores   = ((int64_t)M >= 4) ? 4 : 1;
-    cnrtDim3_t dim           = {num_cores, 1, 1};
-    cnrtFunctionType_t ktype = (num_cores == 4) ? cnrtFuncTypeUnion1 : cnrtFuncTypeBlock;
-    cnrtQueue_t queue        = nullptr;
-
-    elemwise_mul_kernel<<<dim, ktype, queue>>>(
-        A_fp32.data_ptr<float>(),
-        B_fp32.data_ptr<float>(),
-        Out_fp32.data_ptr<float>(),
-        (int)M,
-        (int)K
-    );
-
-    cnrtQueueSync(nullptr);
-
-    // 在 CPU/MLU 上用 PyTorch 高精度 sum 完成 reduce，误差极小
-    // sum(dim=1) -> (M,)，再 unsqueeze -> (M, 1)
+    // 沿 K 维求和，结果 (M, 1)
     auto C = Out_fp32.sum(/*dim=*/1, /*keepdim=*/true);
 
     if (A.scalar_type() != torch::kFloat) {
