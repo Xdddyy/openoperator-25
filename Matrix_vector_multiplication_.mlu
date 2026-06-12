@@ -1,140 +1,204 @@
 #include <bang.h>
 #include <cnrt.h>
 #include <torch/torch.h>
-#include <c10/core/DeviceGuard.h>
+#include <limits>
 #include <framework/core/MLUStream.h>
+#include <c10/core/DeviceGuard.h>
 
-#define M_TILE 64
-#define K_TILE 256
-#define MAX_BLOCK_TASKS 128
+#define FTILE_ELEMS 4096
+#define MAX_TASKS 128
+#define ALIGN_TO(val, align) (((val) + (align) - 1) / (align) * (align))
+#define MTILE 64
+#define KTILE 256
+#define NTILE 64
 
-// 修复：括号对称
-#define ALIGN_UP(value, alignment) ((value) + (alignment) - 1) / (alignment) * (alignment))
+typedef struct {
+    unsigned int x;
+    unsigned int y;
+    unsigned int z;
+    cnrtFunctionType_t ftype;
+} LaunchCfg;
 
-static inline int ClampTaskCount(int requested) {
-    if (requested < 1) return 1;
-    // 修复：宏名统一为 MAX_BLOCK_TASKS
-    if (requested > MAX_BLOCK_TASKS) return MAX_BLOCK_TASKS;
-    return requested;
+static inline int ClampTasks(int req) {
+    if (req < 1) {
+        return 1;
+    }
+    if (req > MAX_TASKS) {
+        return MAX_TASKS;
+    }
+    return req;
 }
 
-__mlu_entry__ void MatrixVectorHalfKernel(
-    float*      output,
-    const half* A,
-    const half* B,
-    int         rows,
-    int         k) {
+__mlu_entry__ void FloatMatVecKernel(float* out,
+                                     const float* mat,
+                                     const float* vec,
+                                     int m,
+                                     int k) {
+    __nram__ float nram_a[FTILE_ELEMS];
+    __nram__ float nram_b[FTILE_ELEMS];
 
-    // A tile: (M_TILE, K_TILE) in half，按 matmul_k 对齐
-    __nram__ half  nram_a[M_TILE * K_TILE];
-    // B tile: (K_TILE,) -> reshape成 filter (1, 1, matmul_k)
-    __nram__ half  nram_b_src[K_TILE];
-    __nram__ half  nram_b_filter[K_TILE];
-    __wram__ half  wram_b[K_TILE];
-    // 输出累加：(M_TILE, 1)
-    __nram__ float nram_acc[M_TILE];
-    __nram__ float nram_partial[M_TILE];
+    for (int r = taskId; r < m; r += taskDim) {
+        const float* row_ptr = mat + (unsigned long long)r * (unsigned long long)k;
+        float acc = 0.0f;
 
-    const int total_row_tiles = (rows + M_TILE - 1) / M_TILE;
-
-    for (int row_tile = taskId; row_tile < total_row_tiles; row_tile += taskDim) {
-        const int row_start = row_tile * M_TILE;
-        int row_count = rows - row_start;
-        if (row_count > M_TILE) row_count = M_TILE;
-        if (row_count <= 0) continue;
-
-        // 初始化累加器
-        for (int i = 0; i < row_count; ++i) {
-            nram_acc[i] = 0.0f;
-        }
-
-        for (int k0 = 0; k0 < k; k0 += K_TILE) {
-            int k_tile = k - k0;
-            if (k_tile > K_TILE) k_tile = K_TILE;
-
-            // matmul 要求 K 维对齐到 32
-            const int matmul_k = ALIGN_UP(k_tile, 32);
-            const size_t a_bytes      = (size_t)k_tile * sizeof(half);
-            const size_t filter_bytes = (size_t)matmul_k * sizeof(half);
-
-            // 清零 A buffer（边界对齐部分补零）
-            for (int i = 0; i < row_count * matmul_k; ++i) {
-                nram_a[i] = (half)0.0f;
+        for (int off = 0; off < k; off += FTILE_ELEMS) {
+            int cur = k - off;
+            if (cur > FTILE_ELEMS) {
+                cur = FTILE_ELEMS;
             }
 
-            // 加载 A[row_start:row_start+row_count, k0:k0+k_tile]
-            // 2D memcpy：每行拷贝 k_tile 个 half，dst stride=matmul_k，src stride=k
-            __memcpy(nram_a,
-                     A + (unsigned long long)row_start * k + k0,
-                     a_bytes,GDRAM2NRAM,
-                     (unsigned int)(matmul_k * sizeof(half)),
-                     (unsigned int)(k        * sizeof(half)),
-                     (unsigned int)(row_count - 1));
-
-            // 清零 B buffer
-            for (int i = 0; i < matmul_k; ++i) {
-                nram_b_src[i] = (half)0.0f;
+            __memcpy(nram_a, row_ptr + off, (size_t)cur * sizeof(float), GDRAM2NRAM);
+            __memcpy(nram_b, vec + off, (size_t)cur * sizeof(float), GDRAM2NRAM);
+            for (int i = 0; i < cur; ++i) {
+                acc += nram_a[i] * nram_b[i];
             }
-
-            // 加载 B[k0:k0+k_tile]
-            __memcpy(nram_b_src, B + k0, a_bytes, GDRAM2NRAM);
-
-            // reshape_filter: 把向量 (matmul_k,) 转成 filter 格式
-            // 签名: (dst, src, co, hi, wi, ci)
-            // 这里 co=1, hi=1, wi=1, ci=matmul_k
-            __bang_reshape_filter(nram_b_filter, nram_b_src,
-                                  1u, 1u, 1u, (unsigned int)matmul_k);
-
-            // 搬到 WRAM
-            __memcpy(wram_b, nram_b_filter, filter_bytes, NRAM2WRAM);
-
-            // matmul: (row_count, matmul_k) x (matmul_k, 1) -> (row_count, 1)
-            __bang_matmul(nram_partial,
-                          nram_a,
-                          wram_b,
-                          (unsigned int)row_count,
-                          (unsigned int)matmul_k,
-                          1u);
-
-            // 累加到 nram_acc，count=row_count
-            __bang_add(nram_acc, nram_acc, nram_partial, (unsigned int)row_count);
         }
 
-        // 写回：row_count 个 float，连续写
-        __memcpy(output + row_start, nram_acc,
-                 (size_t)row_count * sizeof(float), NRAM2GDRAM);
+        out[r] = acc;
     }
 }
 
-torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.dim() == 2, "A must be 2D");
-    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be (K, 1)");
-    TORCH_CHECK(A.size(1) == B.size(0), "A columns must match B rows");
+__mlu_entry__ void HalfMatMulKernel(float* out,
+                                    const half* mat,
+                                    const half* vec,
+                                    int m,
+                                    int k) {
+    __nram__ half nram_a[MTILE * KTILE];
+    __nram__ half nram_b_rows[NTILE * KTILE];
+    __nram__ half nram_b_filt[NTILE * KTILE];
+    __wram__ half wram_b[NTILE * KTILE];
+    __nram__ float nram_acc[MTILE * NTILE];
+    __nram__ float nram_part[MTILE * NTILE];
 
-    const int rows = (int)A.size(0);
-    const int k    = (int)A.size(1);
+    const int total_tiles = (m + MTILE - 1) / MTILE;
+    for (int tile = taskId; tile < total_tiles; tile += taskDim) {
+        const int row_begin = tile * MTILE;
+        int row_num = m - row_begin;
+        if (row_num > MTILE) {
+            row_num = MTILE;
+        }
+        
+        if (row_num <= 0) {
+            continue;
+        }
+
+        for (int i = 0; i < row_num * NTILE; ++i) {
+            nram_acc[i] = 0.0f;
+        }
+
+        for (int k0 = 0; k0 < k; k0 += KTILE) {
+            int k_len = k - k0;
+            if (k_len > KTILE) {
+                k_len = KTILE;
+            }
+            const int aligned_k = ALIGN_TO(k_len, 32);
+            const size_t bytes_a = (size_t)k_len * sizeof(half);
+            const size_t bytes_filt = (size_t)aligned_k * (size_t)NTILE * sizeof(half);
+
+            if (aligned_k != k_len || row_num != MTILE) {
+                for (int i = 0; i < row_num * aligned_k; ++i) {
+                    nram_a[i] = (half)0.0f;
+                }
+            }
+            __memcpy(nram_a,
+                     mat + (unsigned long long)row_begin * (unsigned long long)k +
+                          (unsigned long long)k0,
+                     bytes_a,
+                     GDRAM2NRAM,
+                     (unsigned int)(aligned_k * sizeof(half)),
+                     (int)(k * sizeof(half)),
+                     (unsigned int)(row_num - 1));
+
+            for (int i = 0; i < aligned_k * NTILE; ++i) {
+                nram_b_rows[i] = (half)0.0f;
+            }
+            __memcpy(nram_b_rows,
+                     vec + k0,
+                     bytes_a,
+                     GDRAM2NRAM);
+
+            __bang_reshape_filter(
+                nram_b_filt, nram_b_rows, (unsigned int)NTILE, 1, 1, (unsigned int)aligned_k);
+            __memcpy(wram_b, nram_b_filt, bytes_filt, NRAM2WRAM);
+            __bang_matmul(nram_part,
+                          nram_a,
+                          wram_b,
+                          (unsigned int)row_num,
+                          (unsigned int)aligned_k,
+                          (unsigned int)NTILE);
+            __bang_add(nram_acc, nram_acc, nram_part, (unsigned int)(row_num * NTILE));
+        }
+
+        if (row_num == 1) {
+            __memcpy(out + row_begin, nram_acc, sizeof(float), NRAM2GDRAM);
+        } else {
+            __memcpy(out + row_begin,
+                     nram_acc,
+                     sizeof(float),
+                     NRAM2GDRAM,
+                     sizeof(float),
+                     NTILE * sizeof(float),
+                     (unsigned int)(row_num - 1));
+        }
+    }
+}
+
+static LaunchCfg GetHalfCfg(int m) {
+    LaunchCfg cfg;
+    const int want = (m + MTILE - 1) / MTILE;
+    cfg.x = (unsigned int)ClampTasks(want);
+    cfg.y = 1;
+    cfg.z = 1;
+    cfg.ftype = cnrtFuncTypeBlock;
+    return cfg;
+}
+
+static LaunchCfg GetFloatCfg(int m) {
+    LaunchCfg cfg;
+    cfg.x = (unsigned int)ClampTasks(m);
+    cfg.y = 1;
+    cfg.z = 1;
+    cfg.ftype = cnrtFuncTypeBlock;
+    return cfg;
+}
+
+static int DimVal(const torch::Tensor& t, int d, const char* name) {
+    const int64_t val = t.size(d);
+    return static_cast<int>(val);
+}
+
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
+
+    const int rows = DimVal(A, 0, "A");
+    const int cols = DimVal(A, 1, "A");
+    const int b_rows = DimVal(B, 0, "B");
+    const int b_cols = DimVal(B, 1, "B");
 
     c10::DeviceGuard guard(A.device());
-    auto output = torch::empty({rows, 1},
-                               A.options().dtype(torch::kFloat32));
-    if (rows == 0) return output;
-
-    // 统一转 half：对齐 torch.matmul 的硬件精度路径
-    auto A_half = A.to(torch::kHalf).contiguous();
-    // B shape (K,1) -> view (K,) 再转 half
-    auto B_half = B.view({B.size(0)}).to(torch::kHalf).contiguous();
+    torch::Tensor output = torch::empty({A.size(0), 1}, A.options().dtype(torch::kFloat32));
+    if (rows == 0) {
+        return output;
+    }
 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream(A.device().index());
-
-    const int requested = (rows + M_TILE - 1) / M_TILE;
-    cnrtDim3_t dim = {(unsigned int)ClampTaskCount(requested), 1, 1};
-
-    MatrixVectorHalfKernel<<dim, cnrtFuncTypeBlock, queue>>>(
-        output.data_ptr<float>(),
-        reinterpret_cast<const half*>(A_half.data_ptr<at::Half>()),
-        reinterpret_cast<const half*>(B_half.data_ptr<at::Half>()),
-        rows,
-        k);
-
+    if (A.scalar_type() == torch::kFloat16) {
+        const LaunchCfg cfg = GetHalfCfg(rows);
+        cnrtDim3_t dim = {cfg.x, cfg.y, cfg.z};
+        HalfMatMulKernel<<<dim, cfg.ftype, queue>>>(
+            output.data_ptr<float>(),
+            reinterpret_cast<const half*>(A.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(B.data_ptr<at::Half>()),
+            rows,
+            cols);
+    } else {
+        const LaunchCfg cfg = GetFloatCfg(rows);
+        cnrtDim3_t dim = {cfg.x, cfg.y, cfg.z};
+        FloatMatVecKernel<<<dim, cfg.ftype, queue>>>(
+            output.data_ptr<float>(),
+            A.data_ptr<float>(),
+            B.data_ptr<float>(),
+            rows,
+            cols);
+    }
     return output;
 }
