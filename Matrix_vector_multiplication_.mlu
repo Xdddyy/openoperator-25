@@ -4,10 +4,12 @@
 
 #define CHUNK_SIZE 4096
 
-__mlu_entry__ void gemv_kernel(
+// kernel 只做逐元素乘法，输出 (M, K) 的中间结果
+// 每个核处理若干行，结果写回 GDRAM
+__mlu_entry__ void elemwise_mul_kernel(
     float* A,
     float* B,
-    float* C,
+    float* Out,   // shape (M, K)
     int M,
     int K) {
 
@@ -25,14 +27,10 @@ __mlu_entry__ void gemv_kernel(
 
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
-    __nram__ float nram_mul[CHUNK_SIZE];
+    __nram__ float nram_out[CHUNK_SIZE];
 
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
-
-        // Kahan 补偿求和，降低 float 累积误差
-        float acc  = 0.0f;
-        float comp = 0.0f;
 
         for (uint32_t k = 0; k < (uint32_t)K; k += CHUNK_SIZE) {
             uint32_t len = ((k + CHUNK_SIZE) <= (uint32_t)K)
@@ -42,23 +40,15 @@ __mlu_entry__ void gemv_kernel(
             __bang_write_zero(nram_a, CHUNK_SIZE);
             __bang_write_zero(nram_b, CHUNK_SIZE);
 
+            __memcpy(nram_a, A + row * (uint32_t)K + k, len * sizeof(float), GDRAM2NRAM);
             __memcpy(nram_b, B + k,                      len * sizeof(float), GDRAM2NRAM);
-            __memcpy(nram_a, A + row * (uint32_t)K + k,  len * sizeof(float), GDRAM2NRAM);
 
-            __bang_mul(nram_mul, nram_a, nram_b, CHUNK_SIZE);
+            // 只做乘法，不做累加
+            __bang_mul(nram_out, nram_a, nram_b, CHUNK_SIZE);
 
-            // Kahan 求和：每个元素补偿误差后再累加
-            for (uint32_t idx = 0; idx < len; ++idx) {
-                float y = nram_mul[idx] - comp;
-                float t = acc + y;
-                comp = (t - acc) - y;
-                acc  = t;
-            }
+            // 把乘积写回 Out[row, k..k+len]
+            __memcpy(Out + row * (uint32_t)K + k, nram_out, len * sizeof(float), NRAM2GDRAM);
         }
-
-        __nram__ float nram_result[1];
-        nram_result[0] = acc;
-        __memcpy(C + row, nram_result, sizeof(float), NRAM2GDRAM);
     }
 }
 
@@ -76,25 +66,30 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     auto B_flat  = (B.dim() == 2) ? B.view({B.size(0)}) : B;
     auto B_fp32  = (B.scalar_type() == torch::kFloat) ? B_flat : B_flat.to(torch::kFloat);
 
-    auto C_fp32 = torch::zeros({M, 1}, A_fp32.options());
+    // 中间结果 (M, K)，存放逐元素乘积
+    auto Out_fp32 = torch::empty({M, K}, A_fp32.options());
 
     unsigned int num_cores   = ((int64_t)M >= 4) ? 4 : 1;
     cnrtDim3_t dim           = {num_cores, 1, 1};
     cnrtFunctionType_t ktype = (num_cores == 4) ? cnrtFuncTypeUnion1 : cnrtFuncTypeBlock;
     cnrtQueue_t queue        = nullptr;
 
-    gemv_kernel<<<dim, ktype, queue>>>(
+    elemwise_mul_kernel<<<dim, ktype, queue>>>(
         A_fp32.data_ptr<float>(),
         B_fp32.data_ptr<float>(),
-        C_fp32.data_ptr<float>(),
+        Out_fp32.data_ptr<float>(),
         (int)M,
         (int)K
     );
 
     cnrtQueueSync(nullptr);
 
+    // 在 CPU/MLU 上用 PyTorch 高精度 sum 完成 reduce，误差极小
+    // sum(dim=1) -> (M,)，再 unsqueeze -> (M, 1)
+    auto C = Out_fp32.sum(/*dim=*/1, /*keepdim=*/true);
+
     if (A.scalar_type() != torch::kFloat) {
-        return C_fp32.to(A.scalar_type());
+        return C.to(A.scalar_type());
     }
-    return C_fp32;
+    return C;
 }
