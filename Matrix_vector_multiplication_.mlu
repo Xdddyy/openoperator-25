@@ -25,7 +25,6 @@ __mlu_entry__ void gemv_kernel(
 
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
-    __nram__ float nram_mul[CHUNK_SIZE];
 
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
@@ -36,22 +35,19 @@ __mlu_entry__ void gemv_kernel(
                            ? CHUNK_SIZE
                            : ((uint32_t)K - k);
 
-            __bang_write_zero(nram_a, CHUNK_SIZE);
-            __bang_write_zero(nram_b, CHUNK_SIZE);
+            // 末尾 chunk 不足 CHUNK_SIZE 时清零补齐
+            if (len < CHUNK_SIZE) {
+                __bang_write_zero(nram_a, CHUNK_SIZE);
+                __bang_write_zero(nram_b, CHUNK_SIZE);
+            }
 
             __memcpy(nram_b, B + k,                     len * sizeof(float), GDRAM2NRAM);
             __memcpy(nram_a, A + row * (uint32_t)K + k, len * sizeof(float), GDRAM2NRAM);
 
-            __bang_mul(nram_mul, nram_a, nram_b, CHUNK_SIZE);
-
-            // 树状归约
-            uint32_t rlen = CHUNK_SIZE;
-            while (rlen > 1) {
-                uint32_t rlen2 = rlen / 2;
-                __bang_add(nram_mul, nram_mul, nram_mul + rlen2, rlen2);
-                rlen = rlen2;
-            }
-            acc += nram_mul[0];
+            // __bang_dot 直接计算两个向量的点积，精度更好
+            float chunk_sum = 0.f;
+            __bang_dot(&chunk_sum, nram_a, nram_b, CHUNK_SIZE);
+            acc += chunk_sum;
         }
 
         __nram__ float nram_result[1];
@@ -89,7 +85,6 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         (int)K
     );
 
-    // 同步默认队列，等 kernel 完成后再返回
     cnrtQueueSync(nullptr);
 
     if (A.scalar_type() != torch::kFloat) {
