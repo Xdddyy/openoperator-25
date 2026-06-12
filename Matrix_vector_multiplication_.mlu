@@ -2,12 +2,14 @@
 #include <torch/extension.h>
 #include <cnrt.h>
 
-#define CHUNK_SIZE 4096
+// 每次归约的块大小，越小误差越小
+#define CHUNK_SIZE 128
+#define NRAM_BUF   128
 
-__mlu_entry__ void elemwise_mul_kernel(
+__mlu_entry__ void gemv_kernel(
     float* A,
     float* B,
-    float* Out,
+    float* C,
     int M,
     int K) {
 
@@ -23,28 +25,50 @@ __mlu_entry__ void elemwise_mul_kernel(
     if (count_row == 0) return;
     if (start_row >= (uint32_t)M) return;
 
-    __nram__ float nram_a[CHUNK_SIZE];
-    __nram__ float nram_b[CHUNK_SIZE];
-    __nram__ float nram_out[CHUNK_SIZE];
+    __nram__ float nram_a[NRAM_BUF];
+    __nram__ float nram_b[NRAM_BUF];
+    __nram__ float nram_mul[NRAM_BUF];
 
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
+        float acc = 0.0f;
 
         for (uint32_t k = 0; k < (uint32_t)K; k += CHUNK_SIZE) {
             uint32_t len = ((k + CHUNK_SIZE) <= (uint32_t)K)
-                           ? CHUNK_SIZE
+                           ? (uint32_t)CHUNK_SIZE
                            : ((uint32_t)K - k);
 
-            __bang_write_zero(nram_a, CHUNK_SIZE);
-            __bang_write_zero(nram_b, CHUNK_SIZE);
+            // 清零
+            __bang_write_zero(nram_a, NRAM_BUF);
+            __bang_write_zero(nram_b, NRAM_BUF);
 
+            // 加载数据
             __memcpy(nram_a, A + row * (uint32_t)K + k, len * sizeof(float), GDRAM2NRAM);
             __memcpy(nram_b, B + k,                      len * sizeof(float), GDRAM2NRAM);
 
-            __bang_mul(nram_out, nram_a, nram_b, CHUNK_SIZE);
+            // 逐元素乘
+            __bang_mul(nram_mul, nram_a, nram_b, NRAM_BUF);
 
-            __memcpy(Out + row * (uint32_t)K + k, nram_out, len * sizeof(float), NRAM2GDRAM);
+            // 对本块做树状归约，只归约有效的 len 个元素
+            // 先把有效长度对齐到2的幂次
+            uint32_t rlen = 1;
+            while (rlen < len) rlen <<= 1;
+            // 超出 len 的部分已经是 0（__bang_write_zero 保证），不影响结果
+
+            // 树状归约
+            uint32_t step = rlen;
+            while (step > 1) {
+                uint32_t s2 = step / 2;
+                __bang_add(nram_mul, nram_mul, nram_mul + s2, s2);
+                step = s2;
+            }
+
+            acc += nram_mul[0];
         }
+
+        __nram__ float nram_result[1];
+        nram_result[0] = acc;
+        __memcpy(C + row, nram_result, sizeof(float), NRAM2GDRAM);
     }
 }
 
@@ -58,26 +82,29 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     int64_t M = A.size(0);
     int64_t K = A.size(1);
 
-    auto orig_dtype = A.scalar_type();
-
-    auto A_fp32 = (orig_dtype == torch::kFloat) ? A : A.to(torch::kFloat);
+    auto A_fp32 = (A.scalar_type() == torch::kFloat) ? A : A.to(torch::kFloat);
     auto B_flat  = (B.dim() == 2) ? B.view({B.size(0)}) : B;
     auto B_fp32  = (B.scalar_type() == torch::kFloat) ? B_flat : B_flat.to(torch::kFloat);
 
-    // MLU 上做广播乘法 (M, K)
-    auto Out_fp32 = A_fp32 * B_fp32;
+    auto C_fp32 = torch::zeros({M, 1}, A_fp32.options());
 
-    // 转到 CPU + float64 做高精度 sum，彻底消除累积误差
-    auto Out_cpu_f64 = Out_fp32.to(torch::Device(torch::kCPU)).to(torch::kDouble);
+    unsigned int num_cores   = ((int64_t)M >= 4) ? 4 : 1;
+    cnrtDim3_t dim           = {num_cores, 1, 1};
+    cnrtFunctionType_t ktype = (num_cores == 4) ? cnrtFuncTypeUnion1 : cnrtFuncTypeBlock;
+    cnrtQueue_t queue        = nullptr;
 
-    // sum over K dim，结果 (M, 1)
-    auto C_f64 = Out_cpu_f64.sum(/*dim=*/1, /*keepdim=*/true);
+    gemv_kernel<<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        B_fp32.data_ptr<float>(),
+        C_fp32.data_ptr<float>(),
+        (int)M,
+        (int)K
+    );
 
-    // 转回原始 dtype
-    auto C = C_f64.to(torch::kFloat);
-    if (orig_dtype != torch::kFloat) {
-        C = C.to(orig_dtype);
+    cnrtQueueSync(nullptr);
+
+    if (A.scalar_type() != torch::kFloat) {
+        return C_fp32.to(A.scalar_type());
     }
-
-    return C;
+    return C_fp32;
 }
