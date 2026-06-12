@@ -1,112 +1,141 @@
 #include <bang.h>
-#include <torch/extension.h>
 #include <cnrt.h>
+#include <torch/torch.h>
+#include <c10/core/DeviceGuard.h>
+#include <framework/core/MLUStream.h>
 
-#define NRAM_SIZE 1024
+#define M_TILE 64
+#define K_TILE 256
+#define N_TILE 1
+#define MAX_BLOCKTASKS 128
+#define ALIGN_UP(value, alignment) ((value) + (alignment) - 1) / (alignment) * (alignment))
 
-__mlu_entry__ void gemv_kernel(
-    float* A,
-    float* B,
-    float* C,
-    int M,
-    int K) {
+static inline int ClampTaskCount(int requested) {
+    if (requested < 1) return 1;
+    if (requested > MAX_BLOCK_TASKS) return MAX_BLOCK_TASKS;
+    return requested;
+}
 
-    uint32_t core_id  = taskId;
-    uint32_t core_num = taskDim;
+// half精度 kernel：用 __bang_matmul 硬件指令，精度路径与 torch.matmul 一致
+__mlu_entry__ void MatrixVectorHalfKernel(
+    float* output,
+    const half* A,
+    const half* B,
+    int rows,
+    int k) {
 
-    uint32_t per_core  = (uint32_t)M / core_num;
-    uint32_t remainder = (uint32_t)M % core_num;
+    // nram_a: (M_TILE, K_TILE) in half
+    __nram__ half  nram_a[M_TILE * K_TILE];
+    // nram_b_rows: B 的一段，shape (1, K_TILE) -> reshape成 filter
+    __nram__ half  nram_b_rows[K_TILE];
+    __nram__ half  nram_b_filter[K_TILE];
+    __wram__ half  wram_b[K_TILE];
+    // nram_acc: 累加结果 (M_TILE, 1)
+    __nram__ float nram_acc[M_TILE];
+    __nram__ float nram_partial[M_TILE];
 
-    uint32_t start_row = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t count_row = per_core + (core_id < remainder ? 1 : 0);
+    const int total_row_tiles = (rows + M_TILE - 1) / M_TILE;
 
-    if (count_row == 0) return;
-    if (start_row >= (uint32_t)M) return;
+    for (int row_tile = taskId; row_tile < total_row_tiles; row_tile += taskDim) {
+        const int row_start = row_tile * M_TILE;
+        int row_count = rows - row_start;
+        if (row_count > M_TILE) row_count = M_TILE;
+        if (row_count <= 0) continue;
 
-    __nram__ float nram_a[NRAM_SIZE];
-    __nram__ float nram_b[NRAM_SIZE];
-    __nram__ float nram_mul[NRAM_SIZE];
-
-    for (uint32_t i = 0; i < count_row; ++i) {
-        uint32_t row = start_row + i;
-
-        float acc  = 0.0f;
-        float comp = 0.0f;
-
-        for (uint32_t k = 0; k < (uint32_t)K; k += NRAM_SIZE) {
-            uint32_t len = ((k + NRAM_SIZE) <= (uint32_t)K)
-                           ? (uint32_t)NRAM_SIZE
-                           : ((uint32_t)K - k);
-
-            __bang_write_zero(nram_a,   NRAM_SIZE);
-            __bang_write_zero(nram_b,   NRAM_SIZE);
-            __bang_write_zero(nram_mul, NRAM_SIZE);
-
-            __memcpy(nram_a, A + row * (uint32_t)K + k, len * sizeof(float), GDRAM2NRAM);
-            __memcpy(nram_b, B + k,                      len * sizeof(float), GDRAM2NRAM);
-
-            __bang_mul(nram_mul, nram_a, nram_b, NRAM_SIZE);
-
-            // 树状归约
-            uint32_t step = NRAM_SIZE;
-            while (step > 1) {
-                uint32_t s2 = step / 2;
-                __bang_add(nram_mul, nram_mul, nram_mul + s2, s2);
-                step = s2;
-            }
-
-            // Neumaier 补偿
-            float val     = nram_mul[0];
-            float new_acc = acc + val;
-            if (acc >= val && acc >= -val) {
-                comp += (acc - new_acc) + val;
-            } else {
-                comp += (val - new_acc) + acc;
-            }
-            acc = new_acc;
+        // 初始化累加器
+        for (int i = 0; i < row_count; ++i) {
+            nram_acc[i] = 0.0f;
         }
 
-        __nram__ float nram_result[1];
-        nram_result[0] = acc + comp;
-        __memcpy(C + row, nram_result, sizeof(float), NRAM2GDRAM);
+        for (int k0 = 0; k0 < k; k0 += K_TILE) {
+            int k_tile = k - k0;
+            if (k_tile > K_TILE) k_tile = K_TILE;
+
+            // matmul 要求 K 维对齐到 32
+            const int matmul_k = ALIGN_UP(k_tile, 32);
+            const size_t a_bytes      = (size_t)k_tile * sizeof(half);
+            const size_t filter_bytes = (size_t)matmul_k * sizeof(half);
+
+            // 清零 nram_a（处理边界对齐）
+            for (int i = 0; i < row_count * matmul_k; ++i) {
+                nram_a[i] = (half)0.0f;
+            }
+
+            // 加载 A 的一个 tile：row_count 行，每行 k_tile 个 half
+            // stride跨越完整的 k 维
+            __memcpy(nram_a,
+                     A + (unsigned long)row_start * k + k0,
+                     a_bytes,
+                     GDRAM2NRAM,
+                     (unsigned int)(matmul_k * sizeof(half)),  // dst stride
+                     (unsigned int)(k * sizeof(half)),         // src stride
+                     (unsigned int)(row_count - 1));           // 剩余行数
+
+            // 清零 B 缓冲区
+            for (int i = 0; i < matmul_k; ++i) {
+                nram_b_rows[i] = (half)0.0f;
+            }
+
+            // 加载 B[k0 : k0+k_tile]，shape (k_tile,)
+            __memcpy(nram_b_rows, B + k0, a_bytes, GDRAM2NRAM);
+
+            // reshape_filter 把 (1, 1, matmul_k) -> filter 格式
+            // N_TILE=1，Ci=matmul_k
+            __bang_reshape_filter(
+                nram_b_filter, nram_b_rows,
+                1,          // N (输出通道)
+                1,       // H, W
+                matmul_k);  // Ci (输入通道)
+
+            // 搬到 WRAM
+            __memcpy(wram_b, nram_b_filter, filter_bytes, NRAM2WRAM);
+
+            // 矩阵乘：(row_count, matmul_k) x (matmul_k, 1) -> (row_count, 1)
+            __bang_matmul(nram_partial,
+                          nram_a,
+                          wram_b,
+                          (unsigned int)row_count,
+                          (unsigned int)matmul_k,
+                          1u);
+
+            // 累加到 nram_acc
+            __bang_add(nram_acc, nram_acc, nram_partial, (unsigned int)row_count);
+        }
+
+        // 写回结果，每行一个 float
+        __memcpy(output + row_start, nram_acc, (size_t)row_count * sizeof(float), NRAM2GDRAM);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
-    TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be 2D");
-    TORCH_CHECK(B.dim() == 1 || (B.dim() == 2 && B.size(1) == 1),
-                "B must be 1D or (K,1)");
-    TORCH_CHECK(B.size(0) == A.size(1), "B length must match K");
+    TORCH_CHECK(B.dim() == 2 && B.size(1) == 1, "B must be (K, 1)");
+    TORCH_CHECK(A.size(1) == B.size(0), "A columns must match B rows");
 
-    int64_t M = A.size(0);
-    int64_t K = A.size(1);
+    const int rows = (int)A.size(0);
+    const int k    = (int)A.size(1);
 
-    // 尝试 float16 round-trip，对齐 MLU matmul 内部精度路径
-    auto A_f16 = A.to(torch::kHalf).to(torch::kFloat).contiguous();
-    auto B_in  = (B.dim() == 2) ? B.view({B.size(0)}) : B;
-    auto B_f16 = B_in.to(torch::kHalf).to(torch::kFloat).contiguous();
+    c10::DeviceGuard guard(A.device());
+    auto output = torch::empty({rows, 1},
+                               A.options().dtype(torch::kFloat32));
+    if (rows == 0) return output;
 
-    auto C_fp32 = torch::zeros({M, 1}, A_f16.options());
+    // 统一转 half：无论输入是 float32 还是 float16，都走 half kernel
+    // 这样和 torch.matmul 的硬件精度路径一致
+    auto A_half = A.to(torch::kHalf).contiguous();
+    auto B_half = B.to(torch::kHalf).contiguous();
 
-    unsigned int num_cores   = ((int64_t)M >= 4) ? 4 : 1;
-    cnrtDim3_t dim           = {num_cores, 1, 1};
-    cnrtFunctionType_t ktype = (num_cores == 4) ? cnrtFuncTypeUnion1 : cnrtFuncTypeBlock;
-    cnrtQueue_t queue        = nullptr;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream(A.device().index());
 
-    gemv_kernel<<<dim, ktype, queue>>>(
-        A_f16.data_ptr<float>(),
-        B_f16.data_ptr<float>(),
-        C_fp32.data_ptr<float>(),
-        (int)M,
-        (int)K
-    );
+    const int requested = (rows + M_TILE - 1) / M_TILE;
+    cnrtDim3_t dim = {(unsigned int)ClampTaskCount(requested), 1, 1};
 
-    cnrtQueueSync(nullptr);
+    MatrixVectorHalfKernel<<<dim, cnrtFuncTypeBlock, queue>>>(
+        output.data_ptr<float>(),
+        reinterpret_cast<const half*>(A_half.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(B_half.data_ptr<at::Half>()),
+        rows,
+        k);
 
-    if (A.scalar_type() != torch::kFloat) {
-        return C_fp32.to(A.scalar_type());
-    }
-    return C_fp32;
+    return output;
 }
