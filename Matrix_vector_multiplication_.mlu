@@ -14,7 +14,6 @@ __mlu_entry__ void gemv_kernel(
     uint32_t core_id = taskId;
     uint32_t core_num = taskDim;
 
-    // 计算每个核的起始行和行数
     uint32_t per_core = M / core_num;
     uint32_t remainder = M % core_num;
 
@@ -37,7 +36,6 @@ __mlu_entry__ void gemv_kernel(
         for (uint32_t k = 0; k < (uint32_t)K; k += CHUNK_SIZE) {
             uint32_t len = (k + CHUNK_SIZE <= (uint32_t)K) ? CHUNK_SIZE : ((uint32_t)K - k);
 
-            // 先清零（可选，大致安全）
             __bang_write_zero(nram_b, len);
             __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
@@ -56,7 +54,6 @@ __mlu_entry__ void gemv_kernel(
 }
 
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 检查条件
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be 2D");
@@ -66,15 +63,15 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     int64_t M = A.size(0);
     int64_t K = A.size(1);
 
-    // 转为float类型，保持原dtype
+    // 转为 float
     auto A_fp32 = (A.scalar_type() == torch::kFloat) ? A : A.to(torch::kFloat);
     auto B_flat = (B.dim() == 2) ? B.view({B.size(0)}) : B;
     auto B_fp32 = (B.scalar_type() == torch::kFloat) ? B_flat : B_flat.to(torch::kFloat);
 
-    // 输出张量：形状为 {M}
+    // 创建输出张量，形状为 (M)
     auto C_fp32 = torch::empty({M}, A_fp32.options());
 
-    // 调用 kernel
+    // 调用核
     cnrtQueue_t queue = nullptr;
     unsigned int num_cores = (unsigned int)((M < 4) ? M : 4);
     cnrtDim3_t dim = {num_cores, 1, 1};
@@ -88,10 +85,11 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         (int)K
     );
 
-    // 根据原始输入类型转换回来
-    if (A.scalar_type() == torch::kFloat) {
-        return C_fp32;
-    } else {
-        return C_fp32.to(A.scalar_type());
+    // 返回一维向量，若A不是float，则转回
+    auto result = C_fp32.view({M});
+    if (A.scalar_type() != torch::kFloat) {
+        result = result.to(A.scalar_type());
     }
+
+    return result;
 }
