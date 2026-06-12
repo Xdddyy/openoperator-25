@@ -30,8 +30,9 @@ __mlu_entry__ void gemv_kernel(
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
 
-        // 用 double 累加，减少浮点误差
-        double acc = 0.0;
+        // Kahan 补偿求和，降低 float 累积误差
+        float acc  = 0.0f;
+        float comp = 0.0f;
 
         for (uint32_t k = 0; k < (uint32_t)K; k += CHUNK_SIZE) {
             uint32_t len = ((k + CHUNK_SIZE) <= (uint32_t)K)
@@ -46,14 +47,17 @@ __mlu_entry__ void gemv_kernel(
 
             __bang_mul(nram_mul, nram_a, nram_b, CHUNK_SIZE);
 
-            // double 精度累加，降低误差积累
+            // Kahan 求和：每个元素补偿误差后再累加
             for (uint32_t idx = 0; idx < len; ++idx) {
-                acc += (double)nram_mul[idx];
+                float y = nram_mul[idx] - comp;
+                float t = acc + y;
+                comp = (t - acc) - y;
+                acc  = t;
             }
         }
 
         __nram__ float nram_result[1];
-        nram_result[0] = (float)acc;
+        nram_result[0] = acc;
         __memcpy(C + row, nram_result, sizeof(float), NRAM2GDRAM);
     }
 }
