@@ -11,10 +11,9 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    uint32_t core_id = taskId;    // 当前核ID
-    uint32_t core_num = taskDim;  // 总核数
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
 
-    // 多核任务均分M行，前remainder个核多做一行
     uint32_t per_core = M / core_num;
     uint32_t remainder = M % core_num;
 
@@ -30,14 +29,14 @@ __mlu_entry__ void gemv_kernel(
         uint32_t row = start_row + i;
         __bang_write_zero(nram_sum, 1);
 
-        for (uint32_t k = 0; k < K; k += CHUNK_SIZE) {
-            uint32_t len = (k + CHUNK_SIZE <= K) ? CHUNK_SIZE : (K - k);
+        for (uint32_t k = 0; k < (uint32_t)K; k += CHUNK_SIZE) {
+            uint32_t len = (k + CHUNK_SIZE <= (uint32_t)K) ? CHUNK_SIZE : ((uint32_t)K - k);
 
             __bang_write_zero(nram_b, len);
             __memcpy(nram_b, B + k, len * sizeof(float), GDRAM2NRAM);
 
             __bang_write_zero(nram_a, len);
-            __memcpy(nram_a, A + row * K + k, len * sizeof(float), GDRAM2NRAM);
+            __memcpy(nram_a, A + row * (uint32_t)K + k, len * sizeof(float), GDRAM2NRAM);
 
             __bang_mul(nram_mul, nram_a, nram_b, len);
 
@@ -78,8 +77,8 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     auto C_fp32 = torch::empty({M, 1}, A_fp32.options());
 
     cnrtQueue_t queue = nullptr;
-    // 建议多核数不要超过 M
-    int num_cores = (M < 4) ? M : 4;
+    // 明确uint32_t类型转换，避免窄化警告
+    unsigned int num_cores = (unsigned int)((M < 4) ? M : 4);
     cnrtDim3_t dim = {num_cores, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
 
@@ -87,8 +86,9 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
         A_fp32.data_ptr<float>(),
         B_fp32.data_ptr<float>(),
         C_fp32.data_ptr<float>(),
-        static_cast<int>(M),
-        static_cast<int>(K));
+        (int)M,
+        (int)K
+    );
 
     if (original_dtype != torch::kFloat) {
         return C_fp32.to(original_dtype);
