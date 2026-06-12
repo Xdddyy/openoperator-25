@@ -29,7 +29,10 @@ __mlu_entry__ void gemv_kernel(
 
     for (uint32_t i = 0; i < count_row; ++i) {
         uint32_t row = start_row + i;
-        float acc = 0.0f;
+
+        // 块内用树状归约，块间用 Neumaier 补偿累加
+        float acc  = 0.0f;
+        float comp = 0.0f;  // 补偿项
 
         for (uint32_t k = 0; k < (uint32_t)K; k += NRAM_SIZE) {
             uint32_t len = ((k + NRAM_SIZE) <= (uint32_t)K)
@@ -45,18 +48,28 @@ __mlu_entry__ void gemv_kernel(
 
             __bang_mul(nram_mul, nram_a, nram_b, NRAM_SIZE);
 
-            // 树状归约
+            // 块内树状归约，误差 O(log NRAM_SIZE)
             uint32_t step = NRAM_SIZE;
             while (step > 1) {
                 uint32_t s2 = step / 2;
-                __bang_add(nram_mul, nram_mul, nram_mul + s2, s2);
+                __bang_add(nram_mul, nram_mul + s2, s2);
                 step = s2;
             }
-            acc += nram_mul[0];
+
+            // 块间 Neumaier 补偿累加
+            float val = nram_mul[0];
+            float new_acc = acc + val;
+            // 根据哪个更大决定补偿方向，避免小数吃大数
+            if (acc >= val && acc >= -val) {
+                comp += (acc - new_acc) + val;
+            } else {
+                comp += (val - new_acc) + acc;
+            }
+            acc = new_acc;
         }
 
         __nram__ float nram_result[1];
-        nram_result[0] = acc;
+        nram_result[0] = acc + comp;  // 最终加上补偿项
         __memcpy(C + row, nram_result, sizeof(float), NRAM2GDRAM);
     }
 }
@@ -65,30 +78,27 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be 2D");
-    TORCH_CHECK(B.dim() == 1 || (B.dim() == 2 && B.size(1) == 1),
+    TORCH_CHECK(B.dim() == 1|| (B.dim() == 2 && B.size(1) == 1),
                 "B must be 1D or (K,1)");
     TORCH_CHECK(B.size(0) == A.size(1), "B length must match K");
 
     int64_t M = A.size(0);
     int64_t K = A.size(1);
 
-    // bfloat16 round-trip：对齐参考实现的精度路径
-    // 参考实现做了 randn().bfloat16().float()，matmul 内部也走 bfloat16 路径
-    // 这里显式做同样的 round-trip，让数值完全一致
-    auto A_bf16 = A.to(torch::kBFloat16).to(torch::kFloat).contiguous();
-    auto B_in   = (B.dim() == 2) ? B.view({B.size(0)}) : B;
-    auto B_bf16 = B_in.to(torch::kBFloat16).to(torch::kFloat).contiguous();
+    auto A_fp32 = (A.scalar_type() == torch::kFloat) ? A : A.to(torch::kFloat);
+    auto B_flat = (B.dim() == 2) ? B.view({B.size(0)}) : B;
+    auto B_fp32 = (B.scalar_type() == torch::kFloat) ? B_flat : B_flat.to(torch::kFloat);
 
-    auto C_fp32 = torch::zeros({M, 1}, A_bf16.options());
+    auto C_fp32 = torch::zeros({M, 1}, A_fp32.options());
 
     unsigned int num_cores   = ((int64_t)M >= 4) ? 4 : 1;
     cnrtDim3_t dim           = {num_cores, 1, 1};
     cnrtFunctionType_t ktype = (num_cores == 4) ? cnrtFuncTypeUnion1 : cnrtFuncTypeBlock;
     cnrtQueue_t queue        = nullptr;
 
-    gemv_kernel<<<dim, ktype, queue>>>(
-        A_bf16.data_ptr<float>(),
-        B_bf16.data_ptr<float>(),
+    gemv_kernel<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        B_fp32.data_ptr<float>(),
         C_fp32.data_ptr<float>(),
         (int)M,
         (int)K
