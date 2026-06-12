@@ -11,12 +11,16 @@ __mlu_entry__ void gemv_kernel(
     int M,
     int K) {
 
-    // 单核执行，避免多核taskId、taskDim配置错误
-    uint32_t core_id = 0;
-    uint32_t core_num = 1;
+    // 这里只是核函数逻辑，不能写任何runtime调用！！！
 
-    uint32_t start_row = 0;
-    uint32_t count_row = M;
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+
+    uint32_t per_core = M / core_num;
+    uint32_t remainder = M % core_num;
+
+    uint32_t start_row = core_id * per_core + ((core_id < remainder) ? core_id : remainder);
+    uint32_t count_row = per_core + ((core_id < remainder) ? 1 : 0);
 
     __nram__ float nram_a[CHUNK_SIZE];
     __nram__ float nram_b[CHUNK_SIZE];
@@ -38,32 +42,27 @@ __mlu_entry__ void gemv_kernel(
 
             __bang_mul(nram_mul, nram_a, nram_b, len);
 
-            float sum = 0.f;
+            float sum = 0.0f;
             for (uint32_t idx = 0; idx < len; ++idx) {
                 sum += nram_mul[idx];
             }
             nram_sum[0] += sum;
         }
+
         __memcpy(C + row, nram_sum, sizeof(float), NRAM2GDRAM);
     }
 }
 
-torch::Tensor bang_func(
-    torch::Tensor A,
-    torch::Tensor B) {
-
+torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     TORCH_CHECK(A.is_contiguous(), "A must be contiguous");
     TORCH_CHECK(B.is_contiguous(), "B must be contiguous");
     TORCH_CHECK(A.dim() == 2, "A must be a 2D matrix");
-    TORCH_CHECK(B.dim() == 2 || B.dim() == 1,
-                "B must be a 1D vector or [K,1] tensor");
+    TORCH_CHECK(B.dim() == 2 || B.dim() == 1, "B must be a 1D vector or [K,1] tensor");
 
     int64_t M = A.size(0);
     int64_t K = A.size(1);
-
     if (B.dim() == 2) {
-        TORCH_CHECK(B.size(0) == K && B.size(1) == 1,
-                    "B shape must be [K, 1]");
+        TORCH_CHECK(B.size(0) == K && B.size(1) == 1, "B shape must be [K,1]");
     } else {
         TORCH_CHECK(B.size(0) == K, "B length must be K");
     }
@@ -78,24 +77,21 @@ torch::Tensor bang_func(
 
     auto C_fp32 = torch::empty({M, 1}, A_fp32.options());
 
-    cnrtQueue_t queue = nullptr; // 通常传入nullptr表示默认队列
+    cnrtQueue_t queue = nullptr;
+    cnrtDim3_t dim = {4, 1, 1};  // 按情况设置任务数量
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1; // 示例，确认硬件支持
 
-    // 注意：这里dim设置为1，单核执行
-    cnrtDim3_t dim = {1, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock; // 通常用Block类型启动核函数
-
-    // kernel调用
-    auto err = cnrtInvokeKernel_V3((void*)gemv_kernel, dim, ktype, queue,
-                                  A_fp32.data_ptr<float>(),
-                                  B_fp32.data_ptr<float>(),
-                                  C_fp32.data_ptr<float>(),
-                                  static_cast<int>(M),
-                                  static_cast<int>(K));
-
-    TORCH_CHECK(err == CNRT_RET_SUCCESS, "Kernel launch failed");
+    // 合法的kernel启动形式
+    gemv_kernel<<<dim, ktype, queue>>>(
+        A_fp32.data_ptr<float>(),
+        B_fp32.data_ptr<float>(),
+        C_fp32.data_ptr<float>(),
+        static_cast<int>(M),
+        static_cast<int>(K));
 
     if (original_dtype != torch::kFloat) {
         return C_fp32.to(original_dtype);
     }
+
     return C_fp32;
 }
